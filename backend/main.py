@@ -8,7 +8,8 @@ from typing import Optional, List, Union
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from database import engine, Base, get_db, BASE_DIR
@@ -1311,3 +1312,61 @@ def health_check():
         "system": "Gateway Software Solutions Attendance Engine",
         "timestamp": datetime.datetime.utcnow().isoformat()
     }
+
+
+# ==========================================
+# 5. REACT FRONTEND SERVING
+# ==========================================
+
+# Project root contains both backend/ and frontend/
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+FRONTEND_DIST_DIR = (PROJECT_DIR / "frontend" / "dist").resolve()
+
+
+@app.get("/", include_in_schema=False)
+def serve_frontend():
+    """Serve the React application homepage."""
+    index_file = FRONTEND_DIST_DIR / "index.html"
+
+    if not index_file.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Frontend build not found. "
+                "Run 'npm run build' inside the frontend folder."
+            ),
+        )
+
+    return FileResponse(index_file)
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_frontend_routes(full_path: str):
+    """Serve frontend assets and support React client-side routes."""
+
+    # Do not turn unknown API requests into frontend pages.
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(
+            status_code=404,
+            detail="API endpoint not found",
+        )
+
+    # Resolve the requested file safely inside frontend/dist.
+    requested_file = (FRONTEND_DIST_DIR / full_path).resolve()
+
+    if (
+        requested_file.is_relative_to(FRONTEND_DIST_DIR)
+        and requested_file.is_file()
+    ):
+        return FileResponse(requested_file)
+
+    # Fallback for React routes such as /dashboard.
+    index_file = FRONTEND_DIST_DIR / "index.html"
+
+    if index_file.is_file():
+        return FileResponse(index_file)
+
+    raise HTTPException(
+        status_code=404,
+        detail="Frontend file not found",
+    )
