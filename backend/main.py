@@ -3,6 +3,7 @@ import io
 import csv
 import json
 import datetime
+import base64
 import numpy as np
 from typing import Optional, List, Union
 from fastapi import FastAPI, Depends, HTTPException, Query, status
@@ -575,6 +576,7 @@ def register_employee_face(
 
     photo_url = face_service.save_face_profile_image(payload.image_base64, employee_id)
 
+    emp.face_image = base64.b64decode(payload.image_base64.split(",")[-1])
     emp.face_encoding = json.dumps(encoding)
     emp.face_registered = True
     emp.consent_given = True

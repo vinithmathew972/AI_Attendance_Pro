@@ -2,6 +2,7 @@ import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey
 from sqlalchemy.orm import relationship
 from database import Base
+from sqlalchemy import LargeBinary
 
 class User(Base):
     __tablename__ = "users"
@@ -21,6 +22,7 @@ class Employee(Base):
     name = Column(String(200), nullable=False)                                 # Full Name
     email = Column(String(255), unique=True, index=True, nullable=False)
     department = Column(String(100), nullable=False)
+    face_image = Column(LargeBinary, nullable=True)
     designation = Column(String(100), nullable=False)
     shift_start_time = Column(String(10), default="09:00:00")                  # e.g. 09:00:00
     shift_end_time = Column(String(10), default="18:00:00")                    # e.g. 18:00:00
