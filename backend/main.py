@@ -624,17 +624,69 @@ def remove_employee_face(
     current_ceo: User = Depends(get_current_ceo)
 ):
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
+
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    # Clear all stored biometric data
     emp.face_encoding = None
+    emp.face_image = None
     emp.face_registered = False
     emp.consent_given = False
     emp.consent_timestamp = None
     emp.updated_at = datetime.datetime.utcnow()
+
     db.commit()
 
-    return {"message": f"Face biometric data cleared for {emp.name}."}
+    audit = AuditLog(
+        action="FACE_REMOVED",
+        details=f"Face biometric data removed for {emp.name} ({emp.employee_id}) by CEO.",
+        timestamp=datetime.datetime.utcnow()
+    )
+    db.add(audit)
+    db.commit()
+
+    return {
+        "message": f"Face biometric data cleared for {emp.name}."
+    }
+
+@app.get(
+    "/api/admin/face-storage-status/{employee_code}",
+    tags=["Face Registration"]
+)
+def get_face_storage_status(
+    employee_code: str,
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    CEO-only endpoint to verify whether employee face image
+    is stored in the SQLite BLOB column.
+
+    Does not expose the actual image or face encoding.
+    """
+
+    emp = db.query(Employee).filter(
+        Employee.employee_id == employee_code
+    ).first()
+
+    if not emp:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found."
+        )
+
+    image_bytes = len(emp.face_image) if emp.face_image else 0
+
+    return {
+        "employee_id": emp.employee_id,
+        "employee_name": emp.name,
+        "face_registered": bool(emp.face_registered),
+        "face_image_present": image_bytes > 0,
+        "face_image_bytes": image_bytes,
+        "face_encoding_present": bool(emp.face_encoding),
+        "consent_given": bool(emp.consent_given)
+    }
 
 
 # ==========================================
