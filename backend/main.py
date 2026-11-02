@@ -29,8 +29,22 @@ from auth import (
 import face_service
 from init_db import initialize_database
 
-# Create tables and seed if database is new
+# Create tables
 Base.metadata.create_all(bind=engine)
+
+# Safely add face_image column to existing SQLite database
+with engine.begin() as conn:
+    columns = [
+        row[1]
+        for row in conn.exec_driver_sql("PRAGMA table_info(employees)").fetchall()
+    ]
+
+    if "face_image" not in columns:
+        conn.exec_driver_sql(
+            "ALTER TABLE employees ADD COLUMN face_image BLOB"
+        )
+
+# Initialize database only after schema update
 initialize_database()
 
 app = FastAPI(
