@@ -4,8 +4,11 @@ import csv
 import json
 import datetime
 import base64
+import sqlite3
+import tempfile
 import numpy as np
 from typing import Optional, List, Union
+from starlette.background import BackgroundTask
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -188,6 +191,46 @@ def list_departments(db: Session = Depends(get_db)):
             employee_count=count
         ))
     return result
+
+@app.get("/api/admin/database-backup", tags=["Admin"])
+def download_database_backup(
+    current_ceo: User = Depends(get_current_ceo)
+):
+    db_path = os.path.join(BASE_DIR, "gateway_attendance.db")
+
+    if not os.path.exists(db_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Database file not found."
+        )
+
+    temp_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".db"
+    )
+    backup_path = temp_file.name
+    temp_file.close()
+
+    try:
+        with sqlite3.connect(db_path) as source_db:
+            with sqlite3.connect(backup_path) as backup_db:
+                source_db.backup(backup_db)
+
+        return FileResponse(
+            path=backup_path,
+            filename="gateway_attendance_backup.db",
+            media_type="application/octet-stream",
+            background=BackgroundTask(os.remove, backup_path)
+        )
+
+    except Exception:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Database backup failed."
+        )
 
 @app.post("/api/departments", response_model=DepartmentOut, status_code=status.HTTP_201_CREATED, tags=["Departments"])
 def create_department(
