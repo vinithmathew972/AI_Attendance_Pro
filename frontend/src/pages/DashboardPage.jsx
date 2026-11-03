@@ -16,7 +16,12 @@ import {
   ArrowUpRight,
   ExternalLink,
   FileSpreadsheet,
-  ShieldAlert
+  ShieldAlert,
+  Database,
+  HardDrive,
+  CheckCircle2,
+  AlertCircle,
+  ShieldCheck
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -32,7 +37,13 @@ import {
   Pie
 } from 'recharts';
 import { StatCard } from '../components/StatCard';
-import { getDashboardStatsApi, downloadAttendanceCsvApi, API_BASE_URL } from '../services/api';
+import { 
+  getDashboardStatsApi, 
+  downloadAttendanceCsvApi, 
+  getBackupStatusApi,
+  downloadDatabaseBackupApi,
+  API_BASE_URL 
+} from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { formatTime12Hour } from '../utils/formatters';
 
@@ -42,6 +53,42 @@ export const DashboardPage = ({ onNavigate }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [exporting, setExporting] = useState(false);
+
+  // Database Backup State
+  const [backupStatus, setBackupStatus] = useState(null);
+  const [downloadingBackup, setDownloadingBackup] = useState(false);
+  const [backupFeedback, setBackupFeedback] = useState(null);
+
+  const fetchBackupStatus = async () => {
+    try {
+      const data = await getBackupStatusApi();
+      setBackupStatus(data);
+    } catch (err) {
+      console.error('Failed to load database backup status:', err);
+    }
+  };
+
+  const handleDownloadBackup = async () => {
+    try {
+      setDownloadingBackup(true);
+      setBackupFeedback(null);
+      const res = await downloadDatabaseBackupApi();
+      setBackupFeedback({
+        type: 'success',
+        message: `Consistent SQLite backup (${res.filename}) verified and downloaded successfully!`,
+      });
+      fetchBackupStatus();
+      setTimeout(() => setBackupFeedback(null), 6000);
+    } catch (err) {
+      console.error('Database backup download failed:', err);
+      setBackupFeedback({
+        type: 'error',
+        message: err.response?.data?.detail || 'Failed to generate verified database backup. Please ensure server has write permissions.',
+      });
+    } finally {
+      setDownloadingBackup(false);
+    }
+  };
 
   const fetchStats = async () => {
     try {
@@ -71,8 +118,12 @@ export const DashboardPage = ({ onNavigate }) => {
 
   useEffect(() => {
     fetchStats();
+    fetchBackupStatus();
     // Auto refresh every 30 seconds
-    const interval = setInterval(fetchStats, 30000);
+    const interval = setInterval(() => {
+      fetchStats();
+      fetchBackupStatus();
+    }, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -166,10 +217,10 @@ export const DashboardPage = ({ onNavigate }) => {
           <StatCard
             title="Total Workforce"
             value={stats?.total_employees ?? '--'}
-            subtitle="Registered employees"
+            subtitle={stats?.resigned_employees ? `${stats.active_employees || stats.total_employees} Active · ${stats.resigned_employees} Resigned` : "Active employees"}
             icon={Users}
             color="indigo"
-            badge={{ label: 'Directory', value: 'View All →', positive: true }}
+            badge={{ label: 'Directory', value: stats?.resigned_employees ? `${stats.total_permanent_records} Total →` : 'View All →', positive: true }}
           />
         </div>
 
@@ -430,6 +481,142 @@ export const DashboardPage = ({ onNavigate }) => {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* ======================================================== */}
+      {/* CEO EXECUTIVE SECTION: DATABASE BACKUP MANAGEMENT        */}
+      {/* ======================================================== */}
+      <div className="rounded-3xl bg-white border border-slate-200/90 p-6 shadow-sm space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+          <div>
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-indigo-700 bg-indigo-50 px-2.5 py-0.5 rounded-full border border-indigo-200">
+                System Administration
+              </span>
+              <span className="text-xs text-slate-500">• SQLite Point-In-Time Archives</span>
+            </div>
+            <h3 className="text-lg font-extrabold text-slate-900 flex items-center space-x-2 mt-1.5">
+              <Database className="w-5 h-5 text-indigo-600" />
+              <span>Database Backup</span>
+            </h3>
+            <p className="text-xs text-slate-600 mt-0.5">
+              Generate consistent, verified SQLite database snapshots including all employee records, biometric face images, and attendance history.
+            </p>
+          </div>
+
+          <button
+            onClick={handleDownloadBackup}
+            disabled={downloadingBackup}
+            className="flex items-center justify-center space-x-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold shadow-md shadow-indigo-600/20 transition-all disabled:opacity-60 whitespace-nowrap self-start sm:self-auto"
+          >
+            <Download className={`w-4 h-4 ${downloadingBackup ? 'animate-bounce' : ''}`} />
+            <span>{downloadingBackup ? 'Verifying & Generating Backup...' : 'Download Latest Database Backup'}</span>
+          </button>
+        </div>
+
+        {/* Feedback Alert if any */}
+        {backupFeedback && (
+          <div className={`p-4 rounded-2xl text-xs font-medium flex items-center space-x-2.5 border ${
+            backupFeedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-800'
+          }`}>
+            {backupFeedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            )}
+            <span>{backupFeedback.message}</span>
+          </div>
+        )}
+
+        {/* 4 Core Backup Status Properties Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          
+          {/* 1. Last Backup Date & Time */}
+          <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+              Last Backup Date & Time
+            </span>
+            <p className="text-sm font-extrabold text-slate-900 font-mono">
+              {backupStatus?.last_backup_at
+                ? new Date(backupStatus.last_backup_at).toLocaleString()
+                : 'No backup downloaded yet'}
+            </p>
+            <span className="text-[10px] text-slate-500 block">
+              {backupStatus?.last_backup_at ? 'Point-in-time snapshot' : 'Click download to generate'}
+            </span>
+          </div>
+
+          {/* 2. Backup File Name */}
+          <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+              Backup File Name
+            </span>
+            <p className="text-sm font-bold text-slate-900 font-mono truncate" title={backupStatus?.filename || 'gateway_attendance_backup_*.db'}>
+              {backupStatus?.filename || (backupStatus?.has_backup ? 'gateway_attendance_backup.db' : 'Pending First Backup')}
+            </p>
+            <span className="text-[10px] text-slate-500 block">
+              SQLite binary format (.db)
+            </span>
+          </div>
+
+          {/* 3. Backup File Size */}
+          <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+              Backup File Size
+            </span>
+            <p className="text-sm font-extrabold text-slate-900 font-mono">
+              {backupStatus?.file_size_formatted || (backupStatus?.live_db_size_formatted ? `~${backupStatus.live_db_size_formatted}` : '--')}
+            </p>
+            <span className="text-[10px] text-slate-500 block">
+              {backupStatus?.live_db_size_formatted ? `Live DB: ${backupStatus.live_db_size_formatted}` : 'Includes face BLOBs & logs'}
+            </span>
+          </div>
+
+          {/* 4. Backup Status */}
+          <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 space-y-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+              Backup Status
+            </span>
+            <div className="pt-0.5">
+              {backupStatus?.status === 'Success' ? (
+                <span className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Success (Verified)</span>
+                </span>
+              ) : backupStatus?.status === 'Failed' ? (
+                <span className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  <span>Failed</span>
+                </span>
+              ) : (
+                <span className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                  <span>Ready to Backup</span>
+                </span>
+              )}
+            </div>
+            <span className="text-[10px] text-slate-500 block">
+              PRAGMA quick_check integrity
+            </span>
+          </div>
+
+        </div>
+
+        {/* Deployment Storage Architecture Notice */}
+        <div className="p-4 rounded-2xl bg-amber-50/70 border border-amber-200/80 text-xs text-amber-900 space-y-1.5">
+          <div className="flex items-center space-x-2 font-bold text-amber-950">
+            <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+            <span>Important Deployment Note: Render Storage Architecture</span>
+          </div>
+          <p className="text-[11px] leading-relaxed text-amber-900">
+            The active application is hosted on <strong>Render Free Web Service</strong>. On Render's free tier, the filesystem is <strong>ephemeral</strong> without a mounted persistent disk volume. When the server restarts or redeploys, local container storage resets. 
+          </p>
+          <p className="text-[11px] leading-relaxed text-amber-900">
+            <strong>Disaster Recovery Advisory:</strong> Downloading this verified <span className="font-mono font-bold">.db</span> backup provides an external copy of all employee records, face BLOB photos, and attendance history. However, downloaded backups do not guarantee automatic container restoration upon cold restart — manual database restoration is required if the instance resets.
+          </p>
+        </div>
+
       </div>
 
     </div>

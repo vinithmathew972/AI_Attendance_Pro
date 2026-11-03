@@ -50,7 +50,7 @@ export const KioskPage = ({ onNavigateToEnrollment }) => {
       setLoadingPunches(true);
       const [todayData, empsData] = await Promise.all([
         getTodayAttendanceApi(),
-        getEmployeesApi().catch(() => [])
+        getEmployeesApi({ status: 'Active' }).catch(() => [])
       ]);
       setTodayPunches(todayData || []);
       setAllEmployees(empsData || []);

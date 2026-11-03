@@ -101,6 +101,14 @@ export const deleteEmployeeApi = async (id) => {
   return res.data;
 };
 
+export const resignEmployeeApi = async (id, reason = '', resignationDate = null) => {
+  const res = await api.post(`/api/employees/${id}/resign`, {
+    reason,
+    resignation_date: resignationDate,
+  });
+  return res.data;
+};
+
 export const registerFaceApi = async (id, imageBase64, consent = true) => {
   const res = await api.post(`/api/employees/${id}/register-face`, {
     image_base64: imageBase64,
@@ -197,6 +205,43 @@ export const downloadAttendanceCsvApi = async (params = {}) => {
   link.click();
   document.body.removeChild(link);
   window.URL.revokeObjectURL(url);
+};
+
+// Database Backup APIs (CEO Only)
+export const getBackupStatusApi = async () => {
+  const res = await api.get('/api/admin/backup/status');
+  return res.data;
+};
+
+export const downloadDatabaseBackupApi = async () => {
+  const token = localStorage.getItem('gss_token');
+  const res = await api.get('/api/admin/backup/download', {
+    headers: {
+      Authorization: `Bearer ${token}`
+    },
+    responseType: 'blob',
+  });
+
+  let filename = `gateway_attendance_backup_${new Date().toISOString().slice(0, 10)}.db`;
+  const disposition = res.headers['content-disposition'];
+  if (disposition && disposition.includes('filename=')) {
+    const match = disposition.match(/filename="?([^";]+)"?/);
+    if (match && match[1]) {
+      filename = match[1];
+    }
+  }
+
+  const blob = new Blob([res.data], { type: 'application/x-sqlite3' });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+
+  return { filename, size: blob.size };
 };
 
 export default api;

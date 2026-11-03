@@ -12,13 +12,14 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=False)
     role = Column(String(50), default="CEO")
+    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Employee(Base):
     __tablename__ = "employees"
 
     id = Column(Integer, primary_key=True, index=True)
-    employee_id = Column(String(50), unique=True, index=True, nullable=False)  # e.g. GSS-1001
+    employee_id = Column(String(50), unique=True, index=True, nullable=False)  # e.g. GSS-1001 (Permanent)
     name = Column(String(200), nullable=False)                                 # Full Name
     email = Column(String(255), unique=True, index=True, nullable=False)
     department = Column(String(100), nullable=False)
@@ -33,6 +34,9 @@ class Employee(Base):
     consent_given = Column(Boolean, default=False)
     consent_timestamp = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    employment_status = Column(String(50), default="Active")                  # "Active" or "Resigned"
+    resignation_date = Column(DateTime, nullable=True)
+    resignation_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -103,4 +107,16 @@ class Department(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+class BackupLog(Base):
+    __tablename__ = "backup_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), nullable=False)
+    file_size_bytes = Column(Integer, nullable=False)
+    status = Column(String(50), default="Success")  # "Success" or "Failed"
+    tables_verified = Column(Text, nullable=True)
+    records_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
 

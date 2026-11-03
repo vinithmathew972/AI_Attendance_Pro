@@ -199,6 +199,7 @@ def initialize_database():
                     face_registered=False,
                     consent_given=False,
                     is_active=True,
+                    employment_status="Active",
                     created_at=datetime.datetime.utcnow() - datetime.timedelta(days=30)
                 )
                 db.add(emp)

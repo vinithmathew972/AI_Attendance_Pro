@@ -44,7 +44,7 @@ export const FaceEnrollmentPage = ({ onEnrollmentComplete }) => {
   const fetchEmployees = async () => {
     try {
       setLoading(true);
-      const data = await getEmployeesApi();
+      const data = await getEmployeesApi({ status: 'Active' });
       setEmployees(data || []);
       // Auto select first unregistered if none selected
       if (!selectedEmpId && data && data.length > 0) {

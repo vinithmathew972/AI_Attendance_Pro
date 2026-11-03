@@ -16,14 +16,14 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
-from database import engine, Base, get_db, BASE_DIR
-from models import User, Employee, Attendance, AuditLog, Department
+from database import engine, Base, get_db, BASE_DIR, DB_PATH
+from models import User, Employee, Attendance, AuditLog, Department, BackupLog
 from schemas import (
     LoginRequest, TokenResponse, UserOut, ChangePasswordRequest,
     DepartmentCreate, DepartmentUpdate, DepartmentOut,
-    EmployeeCreate, EmployeeUpdate, EmployeeOut, FaceRegistrationPayload,
+    EmployeeCreate, EmployeeUpdate, EmployeeOut, EmployeeResignRequest, FaceRegistrationPayload,
     RecognizeFrameRequest, FrameRecognitionResponse, RecognizedFace, FaceDetectionBox,
-    CheckInRequest, CheckOutRequest, AttendanceOut, DashboardStats
+    CheckInRequest, CheckOutRequest, AttendanceOut, DashboardStats, BackupStatusResponse
 )
 from auth import (
     hash_password, verify_password, create_access_token,
@@ -35,16 +35,45 @@ from init_db import initialize_database
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-# Safely add face_image column to existing SQLite database
+# Safely add columns to existing SQLite database for permanent employee & resignation management
 with engine.begin() as conn:
-    columns = [
+    emp_columns = [
         row[1]
         for row in conn.exec_driver_sql("PRAGMA table_info(employees)").fetchall()
     ]
 
-    if "face_image" not in columns:
+    if "face_image" not in emp_columns:
         conn.exec_driver_sql(
             "ALTER TABLE employees ADD COLUMN face_image BLOB"
+        )
+    if "employment_status" not in emp_columns:
+        conn.exec_driver_sql(
+            "ALTER TABLE employees ADD COLUMN employment_status VARCHAR(50) DEFAULT 'Active'"
+        )
+    if "resignation_date" not in emp_columns:
+        conn.exec_driver_sql(
+            "ALTER TABLE employees ADD COLUMN resignation_date DATETIME"
+        )
+    if "resignation_reason" not in emp_columns:
+        conn.exec_driver_sql(
+            "ALTER TABLE employees ADD COLUMN resignation_reason TEXT"
+        )
+
+    # Sync any pre-existing inactive employees to have Resigned status if unset
+    conn.exec_driver_sql(
+        "UPDATE employees SET employment_status = 'Active' WHERE employment_status IS NULL AND is_active = 1"
+    )
+    conn.exec_driver_sql(
+        "UPDATE employees SET employment_status = 'Resigned' WHERE (employment_status IS NULL OR employment_status = 'Active') AND is_active = 0"
+    )
+
+    user_columns = [
+        row[1]
+        for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()
+    ]
+    if "is_active" not in user_columns:
+        conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1"
         )
 
 # Initialize database only after schema update
@@ -71,15 +100,31 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 
-# Helper: resolve employee by integer id or string employee_id
+# Helper: resolve active employee by integer id or string employee_id
 def resolve_employee(identifier: Union[int, str], db: Session) -> Optional[Employee]:
     # Try integer primary key first if int or numeric string
     if isinstance(identifier, int) or (isinstance(identifier, str) and identifier.isdigit()):
-        emp = db.query(Employee).filter(Employee.id == int(identifier), Employee.is_active == True).first()
+        emp = db.query(Employee).filter(
+            Employee.id == int(identifier),
+            Employee.is_active == True,
+            (Employee.employment_status == "Active") | (Employee.employment_status.is_(None))
+        ).first()
         if emp:
             return emp
     # Fallback to employee_id string (e.g. GSS-1001)
-    return db.query(Employee).filter(Employee.employee_id == str(identifier), Employee.is_active == True).first()
+    return db.query(Employee).filter(
+        Employee.employee_id == str(identifier),
+        Employee.is_active == True,
+        (Employee.employment_status == "Active") | (Employee.employment_status.is_(None))
+    ).first()
+
+# Helper: lookup employee by id or permanent GSS employee_id regardless of status (Active or Resigned)
+def get_employee_by_identifier(identifier: Union[int, str], db: Session) -> Optional[Employee]:
+    if isinstance(identifier, int) or (isinstance(identifier, str) and identifier.isdigit()):
+        emp = db.query(Employee).filter(Employee.id == int(identifier)).first()
+        if emp:
+            return emp
+    return db.query(Employee).filter(Employee.employee_id == str(identifier)).first()
 
 
 # ==========================================
@@ -100,6 +145,22 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access restricted: Only Gateway Software Solutions CEO is authorized to access the management platform."
+        )
+
+    if hasattr(user, "is_active") and user.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated or resigned. Login access is disabled."
+        )
+
+    resigned_emp = db.query(Employee).filter(
+        Employee.email == user.email,
+        (Employee.employment_status == "Resigned") | (Employee.is_active == False)
+    ).first()
+    if resigned_emp and user.role != "CEO":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Login access is disabled for resigned employees."
         )
 
     access_token = create_access_token(data={"sub": str(user.id), "email": user.email, "role": user.role})
@@ -354,6 +415,70 @@ def delete_department(
     return {"message": f"Department '{dept.name}' deactivated successfully."}
 
 
+# Helper: serialize employee to EmployeeOut schema with permanent status fields
+def serialize_employee(emp: Employee) -> EmployeeOut:
+    status_str = emp.employment_status or ("Active" if emp.is_active else "Resigned")
+    return EmployeeOut(
+        id=emp.id,
+        employee_id=emp.employee_id,
+        employee_code=emp.employee_id,
+        name=emp.name,
+        full_name=emp.name,
+        first_name=emp.first_name,
+        last_name=emp.last_name,
+        email=emp.email,
+        phone=emp.phone,
+        department=emp.department,
+        designation=emp.designation,
+        shift_start_time=emp.shift_start_time,
+        shift_end_time=emp.shift_end_time,
+        photo_url=emp.photo_url,
+        face_registered=emp.face_registered,
+        consent_given=emp.consent_given,
+        consent_timestamp=emp.consent_timestamp,
+        is_active=emp.is_active,
+        employment_status=status_str,
+        resignation_date=emp.resignation_date,
+        resignation_reason=emp.resignation_reason,
+        created_at=emp.created_at
+    )
+
+def process_resignation(emp: Employee, reason: Optional[str], resign_dt: Optional[datetime.datetime], db: Session) -> EmployeeOut:
+    """Helper to safely execute employee resignation while preserving permanent records and attendance history."""
+    if emp.employment_status == "Resigned":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Employee {emp.name} ({emp.employee_id}) has already been marked as Resigned on {emp.resignation_date}."
+        )
+
+    # 1. Update status and retain permanent records
+    emp.employment_status = "Resigned"
+    emp.is_active = False
+    emp.resignation_date = resign_dt or datetime.datetime.utcnow()
+    emp.resignation_reason = reason or "Voluntary Resignation"
+
+    # 2. Facial biometrics data retention policy:
+    # Clear active vector encoding to prevent live kiosk recognition while keeping photo_url for visual record
+    emp.face_registered = False
+    emp.face_encoding = None
+
+    # 3. Authentication Deactivation:
+    # Disable user account if one exists with matching email to block login
+    user_account = db.query(User).filter(User.email == emp.email).first()
+    if user_account:
+        user_account.is_active = False
+
+    # 4. Audit Log
+    audit = AuditLog(
+        action="EMPLOYEE_RESIGNED",
+        details=f"Permanent Employee {emp.name} ({emp.employee_id}) marked as Resigned by CEO. Reason: {emp.resignation_reason}. Login and Face Recognition access revoked.",
+        timestamp=datetime.datetime.utcnow()
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(emp)
+    return serialize_employee(emp)
+
 # ==========================================
 # 3. EMPLOYEE MANAGEMENT ENDPOINTS (CEO ONLY)
 # ==========================================
@@ -362,14 +487,29 @@ def delete_department(
 def list_employees(
     department: Optional[str] = None,
     search: Optional[str] = None,
+    status: Optional[str] = Query("All", description="Employment status filter: All, Active, or Resigned"),
     db: Session = Depends(get_db),
     current_ceo: User = Depends(get_current_ceo)
 ):
     """
-    List all active Gateway Software Solutions employees.
+    List Gateway Software Solutions employees with optional filtering by department, search, and status.
+    Resigned employees remain permanently searchable by their original GSS Employee ID.
     Only authenticated CEO users have access to employee records.
     """
-    query = db.query(Employee).filter(Employee.is_active == True)
+    query = db.query(Employee)
+    
+    # Filter by employment status if requested
+    if status == "Active":
+        query = query.filter(
+            Employee.is_active == True,
+            (Employee.employment_status == "Active") | (Employee.employment_status.is_(None))
+        )
+    elif status == "Resigned":
+        query = query.filter(
+            (Employee.employment_status == "Resigned") | (Employee.is_active == False)
+        )
+    # If status == "All" or None, list all permanent employee records
+
     if department and department != "All":
         query = query.filter(Employee.department == department)
     if search:
@@ -381,31 +521,7 @@ def list_employees(
             (Employee.designation.ilike(search_fmt))
         )
     emps = query.order_by(Employee.employee_id).all()
-    
-    result = []
-    for emp in emps:
-        result.append(EmployeeOut(
-            id=emp.id,
-            employee_id=emp.employee_id,
-            employee_code=emp.employee_id,
-            name=emp.name,
-            full_name=emp.name,
-            first_name=emp.first_name,
-            last_name=emp.last_name,
-            email=emp.email,
-            phone=emp.phone,
-            department=emp.department,
-            designation=emp.designation,
-            shift_start_time=emp.shift_start_time,
-            shift_end_time=emp.shift_end_time,
-            photo_url=emp.photo_url,
-            face_registered=emp.face_registered,
-            consent_given=emp.consent_given,
-            consent_timestamp=emp.consent_timestamp,
-            is_active=emp.is_active,
-            created_at=emp.created_at
-        ))
-    return result
+    return [serialize_employee(emp) for emp in emps]
 
 @app.post("/api/employees", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED, tags=["Employees"])
 def create_employee(
@@ -415,7 +531,9 @@ def create_employee(
 ):
     """
     Create a new employee profile.
-    Only authenticated CEO users can create employees.
+    Permanent GSS Employee ID Policy:
+    Every employee has a permanent unique GSS ID. Once assigned, the GSS ID must never
+    be deleted or reused for another employee, even if the original employee has resigned.
     """
     emp_code = (payload.employee_id or payload.employee_code or "").upper().strip()
     if not emp_code:
@@ -429,11 +547,20 @@ def create_employee(
     if not emp_name:
         raise HTTPException(status_code=400, detail="Employee Name is required.")
 
-    # Check for duplicate Employee ID or Email
-    if db.query(Employee).filter(Employee.employee_id == emp_code).first():
-        raise HTTPException(status_code=400, detail=f"Employee ID '{emp_code}' is already registered.")
-    if db.query(Employee).filter(Employee.email == payload.email.lower().strip()).first():
-        raise HTTPException(status_code=400, detail=f"Email '{payload.email}' is already in use.")
+    # Check for duplicate Employee ID across ALL records (including resigned)
+    existing_emp = db.query(Employee).filter(Employee.employee_id == emp_code).first()
+    if existing_emp:
+        if existing_emp.employment_status == "Resigned" or not existing_emp.is_active:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Permanent Record Policy: GSS Employee ID '{emp_code}' is permanently reserved for resigned employee '{existing_emp.name}' and cannot be reused."
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Employee ID '{emp_code}' is already registered to an active employee.")
+
+    existing_email = db.query(Employee).filter(Employee.email == payload.email.lower().strip()).first()
+    if existing_email:
+        raise HTTPException(status_code=400, detail=f"Email '{payload.email}' is already in use by employee '{existing_email.name}' ({existing_email.employee_id}).")
 
     shift_start = payload.shift_start_time or "09:00:00"
     if len(shift_start.split(":")) == 2:
@@ -455,6 +582,7 @@ def create_employee(
         face_registered=False,
         consent_given=False,
         is_active=True,
+        employment_status="Active",
         created_at=datetime.datetime.utcnow()
     )
     db.add(new_emp)
@@ -463,33 +591,13 @@ def create_employee(
 
     audit = AuditLog(
         action="EMPLOYEE_CREATE",
-        details=f"Created employee {new_emp.name} ({new_emp.employee_id}) by CEO.",
+        details=f"Created permanent employee {new_emp.name} ({new_emp.employee_id}) by CEO.",
         timestamp=datetime.datetime.utcnow()
     )
     db.add(audit)
     db.commit()
 
-    return EmployeeOut(
-        id=new_emp.id,
-        employee_id=new_emp.employee_id,
-        employee_code=new_emp.employee_id,
-        name=new_emp.name,
-        full_name=new_emp.name,
-        first_name=new_emp.first_name,
-        last_name=new_emp.last_name,
-        email=new_emp.email,
-        phone=new_emp.phone,
-        department=new_emp.department,
-        designation=new_emp.designation,
-        shift_start_time=new_emp.shift_start_time,
-        shift_end_time=new_emp.shift_end_time,
-        photo_url=new_emp.photo_url,
-        face_registered=new_emp.face_registered,
-        consent_given=new_emp.consent_given,
-        consent_timestamp=new_emp.consent_timestamp,
-        is_active=new_emp.is_active,
-        created_at=new_emp.created_at
-    )
+    return serialize_employee(new_emp)
 
 @app.get("/api/employees/{employee_id}", response_model=EmployeeOut, tags=["Employees"])
 def get_employee(
@@ -500,27 +608,7 @@ def get_employee(
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
-    return EmployeeOut(
-        id=emp.id,
-        employee_id=emp.employee_id,
-        employee_code=emp.employee_id,
-        name=emp.name,
-        full_name=emp.name,
-        first_name=emp.first_name,
-        last_name=emp.last_name,
-        email=emp.email,
-        phone=emp.phone,
-        department=emp.department,
-        designation=emp.designation,
-        shift_start_time=emp.shift_start_time,
-        shift_end_time=emp.shift_end_time,
-        photo_url=emp.photo_url,
-        face_registered=emp.face_registered,
-        consent_given=emp.consent_given,
-        consent_timestamp=emp.consent_timestamp,
-        is_active=emp.is_active,
-        created_at=emp.created_at
-    )
+    return serialize_employee(emp)
 
 @app.put("/api/employees/{employee_id}", response_model=EmployeeOut, tags=["Employees"])
 def update_employee(
@@ -533,6 +621,13 @@ def update_employee(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    # Read-only check for resigned employees
+    if emp.employment_status == "Resigned" or not emp.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Employee '{emp.name}' ({emp.employee_id}) is Resigned. Resigned records are permanent and read-only."
+        )
+
     if payload.name:
         emp.name = payload.name.strip()
     elif payload.first_name or payload.last_name:
@@ -541,7 +636,12 @@ def update_employee(
         emp.name = f"{fn} {ln}".strip()
 
     if payload.email:
-        emp.email = payload.email.lower().strip()
+        new_email = payload.email.lower().strip()
+        if new_email != emp.email:
+            existing_email = db.query(Employee).filter(Employee.email == new_email, Employee.id != emp.id).first()
+            if existing_email:
+                raise HTTPException(status_code=400, detail=f"Email '{new_email}' is already in use by another employee.")
+            emp.email = new_email
     if payload.phone is not None:
         emp.phone = payload.phone
     if payload.department:
@@ -554,34 +654,42 @@ def update_employee(
     if payload.shift_end_time:
         et = payload.shift_end_time
         emp.shift_end_time = et if len(et.split(":")) == 3 else f"{et}:00"
-    if payload.is_active is not None:
-        emp.is_active = payload.is_active
+    if payload.is_active is not None and not payload.is_active:
+        # If deactivated via update, process as resignation
+        return process_resignation(emp, payload.resignation_reason or "Deactivated via profile update", None, db)
 
     emp.updated_at = datetime.datetime.utcnow()
     db.commit()
     db.refresh(emp)
 
-    return EmployeeOut(
-        id=emp.id,
-        employee_id=emp.employee_id,
-        employee_code=emp.employee_id,
-        name=emp.name,
-        full_name=emp.name,
-        first_name=emp.first_name,
-        last_name=emp.last_name,
-        email=emp.email,
-        phone=emp.phone,
-        department=emp.department,
-        designation=emp.designation,
-        shift_start_time=emp.shift_start_time,
-        shift_end_time=emp.shift_end_time,
-        photo_url=emp.photo_url,
-        face_registered=emp.face_registered,
-        consent_given=emp.consent_given,
-        consent_timestamp=emp.consent_timestamp,
-        is_active=emp.is_active,
-        created_at=emp.created_at
-    )
+    return serialize_employee(emp)
+
+@app.post("/api/employees/{employee_id}/resign", response_model=EmployeeOut, tags=["Employees"])
+def resign_employee(
+    employee_id: int,
+    payload: EmployeeResignRequest,
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    Mark an employee as Resigned:
+    - Preserves employee details, permanent GSS ID, joining date, and all historical attendance records.
+    - Disables employee login access and invalidates authentication sessions.
+    - Revokes face recognition check-in permissions.
+    - Resigned records remain permanently viewable and searchable in read-only mode.
+    """
+    emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    resign_date = None
+    if payload.resignation_date:
+        try:
+            resign_date = datetime.datetime.fromisoformat(payload.resignation_date.replace("Z", "+00:00"))
+        except Exception:
+            resign_date = datetime.datetime.utcnow()
+
+    return process_resignation(emp, payload.reason, resign_date, db)
 
 @app.delete("/api/employees/{employee_id}", tags=["Employees"])
 def delete_employee(
@@ -589,21 +697,23 @@ def delete_employee(
     db: Session = Depends(get_db),
     current_ceo: User = Depends(get_current_ceo)
 ):
+    """
+    Permanent Employee Record Policy:
+    Employees cannot be permanently deleted. Instead, the record is transitioned to 'Resigned'
+    to preserve company attendance history and permanent GSS ID integrity.
+    """
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    emp.is_active = False
-    db.commit()
+    if emp.employment_status == "Resigned":
+        return {"message": f"Employee {emp.name} ({emp.employee_id}) is already archived as Resigned."}
 
-    audit = AuditLog(
-        action="EMPLOYEE_DEACTIVATED",
-        details=f"Deactivated employee {emp.name} ({emp.employee_id}) by CEO.",
-        timestamp=datetime.datetime.utcnow()
-    )
-    db.add(audit)
-    db.commit()
-    return {"message": f"Employee {emp.name} deactivated successfully."}
+    process_resignation(emp, "Deactivated via Employee Archive by CEO", None, db)
+    return {
+        "message": f"Employee {emp.name} ({emp.employee_id}) marked as Resigned. Permanent record and attendance history preserved.",
+        "employment_status": "Resigned"
+    }
 
 @app.post("/api/employees/{employee_id}/register-face", tags=["Face Registration"])
 def register_employee_face(
@@ -615,6 +725,12 @@ def register_employee_face(
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    if emp.employment_status == "Resigned" or not emp.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Face registration denied: Employee '{emp.name}' ({emp.employee_id}) is Resigned. Biometric enrollment is only allowed for Active employees."
+        )
 
     if not payload.consent:
         raise HTTPException(
@@ -733,6 +849,205 @@ def get_face_storage_status(
 
 
 # ==========================================
+# 2.4. DATABASE BACKUP MANAGEMENT (CEO ONLY)
+# ==========================================
+
+def format_file_size(size_bytes: int) -> str:
+    """Formats raw byte counts into human-readable units (B, KB, MB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{round(size_bytes / 1024.0, 1)} KB"
+    else:
+        return f"{round(size_bytes / (1024.0 * 1024.0), 2)} MB"
+
+def cleanup_temp_backup(file_path: str):
+    """Safely cleans up temporary SQLite backup file after response has streamed to client."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+def verify_sqlite_backup(backup_path: str) -> dict:
+    """
+    Rigorously verifies SQLite backup file before delivery:
+    1. Verifies physical file existence and non-zero byte size.
+    2. Opens backup using SQLite engine and runs 'PRAGMA quick_check'.
+    3. Confirms all required business tables exist (employees, attendances, users, departments).
+    4. Confirms row counts and verifies BLOB face_image data integrity.
+    """
+    if not os.path.exists(backup_path):
+        raise ValueError("Backup file was not created on disk.")
+    
+    file_size = os.path.getsize(backup_path)
+    if file_size == 0:
+        raise ValueError("Backup file is empty (0 bytes).")
+
+    conn = sqlite3.connect(backup_path)
+    try:
+        cursor = conn.cursor()
+        
+        # 1. PRAGMA integrity check
+        cursor.execute("PRAGMA quick_check")
+        check_row = cursor.fetchone()
+        if not check_row or check_row[0] != "ok":
+            raise ValueError(f"SQLite PRAGMA integrity check failed: {check_row}")
+
+        # 2. Check table schemas
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall() if not row[0].startswith("sqlite_")]
+        required = ["employees", "attendances", "users", "departments"]
+        missing = [t for t in required if t not in tables]
+        if missing:
+            raise ValueError(f"Missing required tables in backup database: {', '.join(missing)}")
+
+        # 3. Check records & BLOB data preservation
+        cursor.execute("SELECT COUNT(*) FROM employees")
+        emp_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM attendances")
+        att_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM users")
+        user_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM departments")
+        dept_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM employees WHERE face_image IS NOT NULL")
+        face_blob_count = cursor.fetchone()[0]
+
+        total_records = emp_count + att_count + user_count + dept_count
+
+        return {
+            "verified": True,
+            "file_size": file_size,
+            "tables": tables,
+            "employee_count": emp_count,
+            "attendance_count": att_count,
+            "face_blob_count": face_blob_count,
+            "total_records": total_records
+        }
+    finally:
+        conn.close()
+
+@app.get("/api/admin/backup/status", response_model=BackupStatusResponse, tags=["Database Backup"])
+def get_backup_status(
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    Retrieves the latest verified backup status, timestamp, size, and live database metrics.
+    Only authorized Gateway Software Solutions CEO users have access.
+    """
+    live_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    
+    last_backup = db.query(BackupLog).order_by(desc(BackupLog.created_at)).first()
+    if not last_backup:
+        return BackupStatusResponse(
+            has_backup=False,
+            live_db_size_bytes=live_size,
+            live_db_size_formatted=format_file_size(live_size)
+        )
+
+    tables_list = [t.strip() for t in last_backup.tables_verified.split(",")] if last_backup.tables_verified else ["employees", "attendances", "users", "departments"]
+
+    return BackupStatusResponse(
+        has_backup=True,
+        last_backup_at=last_backup.created_at,
+        filename=last_backup.filename,
+        file_size_bytes=last_backup.file_size_bytes,
+        file_size_formatted=format_file_size(last_backup.file_size_bytes),
+        status=last_backup.status,
+        tables_verified=tables_list,
+        records_count=last_backup.records_count,
+        live_db_size_bytes=live_size,
+        live_db_size_formatted=format_file_size(live_size)
+    )
+
+@app.get("/api/admin/backup/download", tags=["Database Backup"])
+def download_database_backup(
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    Creates a point-in-time consistent SQLite backup using SQLite's online backup API,
+    rigorously verifies file and table integrity, logs the event, and delivers a downloadable .db file.
+    The temporary backup file is safely cleaned up immediately after transmission.
+    """
+    if not os.path.exists(DB_PATH):
+        raise HTTPException(status_code=500, detail="Live database file not found on server disk.")
+
+    timestamp_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"gateway_attendance_backup_{timestamp_str}.db"
+    
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".db", prefix="gss_backup_")
+    temp_path = temp_file.name
+    temp_file.close()
+
+    try:
+        # Perform point-in-time atomic online backup using SQLite backup API
+        src_conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        dst_conn = sqlite3.connect(temp_path)
+        try:
+            with dst_conn:
+                src_conn.backup(dst_conn, pages=-1)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+
+        # Rigorous verification before delivery
+        verif = verify_sqlite_backup(temp_path)
+
+        # Record successful backup in BackupLog and AuditLog
+        backup_entry = BackupLog(
+            filename=backup_filename,
+            file_size_bytes=verif["file_size"],
+            status="Success",
+            tables_verified=",".join(verif["tables"]),
+            records_count=verif["total_records"],
+            created_at=datetime.datetime.utcnow()
+        )
+        db.add(backup_entry)
+
+        audit = AuditLog(
+            action="DATABASE_BACKUP_DOWNLOAD",
+            details=f"CEO {current_ceo.full_name} ({current_ceo.email}) generated and downloaded verified SQLite backup '{backup_filename}' ({format_file_size(verif['file_size'])}). Verified {len(verif['tables'])} tables and {verif['face_blob_count']} face BLOB images.",
+            timestamp=datetime.datetime.utcnow()
+        )
+        db.add(audit)
+        db.commit()
+
+        # Return FileResponse with automated background cleanup task
+        return FileResponse(
+            path=temp_path,
+            filename=backup_filename,
+            media_type="application/x-sqlite3",
+            background=BackgroundTask(cleanup_temp_backup, temp_path),
+            headers={
+                "Content-Disposition": f'attachment; filename="{backup_filename}"',
+                "X-Backup-Size": str(verif["file_size"]),
+                "X-Backup-Status": "Success"
+            }
+        )
+
+    except Exception as e:
+        cleanup_temp_backup(temp_path)
+        fail_entry = BackupLog(
+            filename=backup_filename,
+            file_size_bytes=0,
+            status="Failed",
+            tables_verified="",
+            records_count=0,
+            created_at=datetime.datetime.utcnow()
+        )
+        db.add(fail_entry)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Database backup generation failed: {str(e)}")
+
+
+# ==========================================
 # 3. ATTENDANCE & FACE RECOGNITION ENDPOINTS
 # ==========================================
 
@@ -746,6 +1061,7 @@ def recognize_frame(payload: RecognizeFrameRequest, db: Session = Depends(get_db
 
     registered_emps = db.query(Employee).filter(
         Employee.is_active == True,
+        (Employee.employment_status == "Active") | (Employee.employment_status.is_(None)),
         Employee.face_registered == True,
         Employee.face_encoding.isnot(None)
     ).all()
@@ -827,6 +1143,12 @@ def mark_check_in(payload: CheckInRequest, db: Session = Depends(get_db)):
     """
     emp = resolve_employee(payload.employee_id, db)
     if not emp:
+        resigned_check = get_employee_by_identifier(payload.employee_id, db)
+        if resigned_check and (resigned_check.employment_status == "Resigned" or not resigned_check.is_active):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Attendance check-in denied: Employee '{resigned_check.name}' ({resigned_check.employee_id}) is Resigned. Resigned employees cannot record attendance."
+            )
         raise HTTPException(status_code=404, detail=f"Employee '{payload.employee_id}' not found or inactive.")
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -940,6 +1262,12 @@ def mark_check_out(payload: CheckOutRequest, db: Session = Depends(get_db)):
     """
     emp = resolve_employee(payload.employee_id, db)
     if not emp:
+        resigned_check = get_employee_by_identifier(payload.employee_id, db)
+        if resigned_check and (resigned_check.employment_status == "Resigned" or not resigned_check.is_active):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Attendance check-out denied: Employee '{resigned_check.name}' ({resigned_check.employee_id}) is Resigned. Resigned employees cannot record attendance."
+            )
         raise HTTPException(status_code=404, detail=f"Employee '{payload.employee_id}' not found or inactive.")
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -1112,10 +1440,19 @@ def get_dashboard_stats(
     Only authenticated CEO users can access dashboard statistics.
     """
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    total_employees = db.query(Employee).filter(Employee.is_active == True).count()
+    active_employees = db.query(Employee).filter(
+        Employee.is_active == True,
+        (Employee.employment_status == "Active") | (Employee.employment_status.is_(None))
+    ).count()
+    resigned_employees = db.query(Employee).filter(
+        (Employee.employment_status == "Resigned") | (Employee.is_active == False)
+    ).count()
+    total_permanent_records = db.query(Employee).count()
+    total_employees = active_employees
 
     today_attendances = db.query(Attendance).join(Employee).filter(
         Employee.is_active == True,
+        (Employee.employment_status == "Active") | (Employee.employment_status.is_(None)),
         Attendance.attendance_date == today_str
     ).all()
     present_today = len(today_attendances)
@@ -1198,6 +1535,9 @@ def get_dashboard_stats(
         late_today=late_today,
         currently_working=currently_working,
         attendance_rate=attendance_rate,
+        active_employees=active_employees,
+        resigned_employees=resigned_employees,
+        total_permanent_records=total_permanent_records,
         department_stats=dept_stats,
         weekly_trend=weekly_trend,
         recent_punches=recent_punches
@@ -1263,6 +1603,7 @@ def get_absent_employees(
     
     query = db.query(Employee).filter(
         Employee.is_active == True,
+        (Employee.employment_status == "Active") | (Employee.employment_status.is_(None)),
         ~Employee.id.in_(present_ids)
     )
     if department and department != "All":

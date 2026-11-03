@@ -74,6 +74,13 @@ class EmployeeUpdate(BaseModel):
     shift_start_time: Optional[str] = None
     shift_end_time: Optional[str] = None
     is_active: Optional[bool] = None
+    employment_status: Optional[str] = None
+    resignation_date: Optional[datetime] = None
+    resignation_reason: Optional[str] = None
+
+class EmployeeResignRequest(BaseModel):
+    reason: Optional[str] = "Voluntary Resignation"
+    resignation_date: Optional[str] = None
 
 class EmployeeOut(BaseModel):
     id: int
@@ -94,6 +101,9 @@ class EmployeeOut(BaseModel):
     consent_given: bool
     consent_timestamp: Optional[datetime] = None
     is_active: bool
+    employment_status: Optional[str] = "Active"
+    resignation_date: Optional[datetime] = None
+    resignation_reason: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -176,6 +186,24 @@ class DashboardStats(BaseModel):
     late_today: int
     currently_working: int
     attendance_rate: float
+    active_employees: Optional[int] = None
+    resigned_employees: Optional[int] = None
+    total_permanent_records: Optional[int] = None
     department_stats: List[Dict[str, Any]]
     weekly_trend: List[Dict[str, Any]]
     recent_punches: List[Dict[str, Any]]
+
+class BackupStatusResponse(BaseModel):
+    has_backup: bool
+    last_backup_at: Optional[datetime] = None
+    filename: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    file_size_formatted: Optional[str] = None
+    status: Optional[str] = None
+    tables_verified: Optional[List[str]] = None
+    records_count: Optional[int] = None
+    live_db_size_bytes: Optional[int] = None
+    live_db_size_formatted: Optional[str] = None
+    storage_type: str = "Render Web Service (Ephemeral Filesystem)"
+    storage_warning: str = "SQLite file storage on Render Free tier is ephemeral. Container restarts or redeployments re-initialize local disk storage. Downloaded backups must be manually restored if the container resets."
+

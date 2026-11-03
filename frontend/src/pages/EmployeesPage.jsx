@@ -16,13 +16,18 @@ import {
   Phone,
   Mail,
   Clock,
-  Building
+  Building,
+  UserMinus,
+  FileText,
+  Eye,
+  ShieldAlert
 } from 'lucide-react';
 import { 
   getEmployeesApi, 
   createEmployeeApi, 
   updateEmployeeApi, 
   deleteEmployeeApi, 
+  resignEmployeeApi,
   registerFaceApi, 
   removeFaceApi,
   getDepartmentsApi,
@@ -42,13 +47,18 @@ export const EmployeesPage = () => {
   // Search & Filter
   const [search, setSearch] = useState('');
   const [departmentFilter, setDepartmentFilter] = useState('All');
+  const [statusFilter, setStatusFilter] = useState('All');
 
   // Modals state
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isFaceModalOpen, setIsFaceModalOpen] = useState(false);
   const [isDeptModalOpen, setIsDeptModalOpen] = useState(false);
+  const [isResignModalOpen, setIsResignModalOpen] = useState(false);
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
   const [selectedEmployee, setSelectedEmployee] = useState(null);
+  const [resignReason, setResignReason] = useState('Voluntary Resignation');
+  const [resigning, setResigning] = useState(false);
 
   // Quick department entry state inside add/edit
   const [customDeptInput, setCustomDeptInput] = useState('');
@@ -103,6 +113,7 @@ export const EmployeesPage = () => {
       const data = await getEmployeesApi({
         department: departmentFilter !== 'All' ? departmentFilter : undefined,
         search: search.trim() ? search.trim() : undefined,
+        status: statusFilter !== 'All' ? statusFilter : undefined,
       });
       setEmployees(data || []);
     } catch (err) {
@@ -115,7 +126,7 @@ export const EmployeesPage = () => {
 
   useEffect(() => {
     fetchEmployees();
-  }, [departmentFilter]);
+  }, [departmentFilter, statusFilter]);
 
   const handleSearchSubmit = (e) => {
     e.preventDefault();
@@ -124,15 +135,23 @@ export const EmployeesPage = () => {
 
   // Open Add Modal
   const openAddModal = () => {
-    // Generate next suggested code
-    const nextCode = `GSS-${1000 + employees.length + 1}`;
+    // Generate next suggested code by calculating max numeric suffix across all permanent GSS IDs
+    const maxNum = employees.reduce((max, e) => {
+      const match = (e.employee_code || e.employee_id || '').match(/\d+/);
+      if (match) {
+        const val = parseInt(match[0], 10);
+        return val > max ? val : max;
+      }
+      return max;
+    }, 1000);
+    const nextCode = `GSS-${maxNum + 1}`;
     setFormData({
       employee_code: nextCode,
       first_name: '',
       last_name: '',
       email: '',
       phone: '+91 ',
-      department: 'Engineering',
+      department: departmentsList.length > 0 ? departmentsList[0].name : 'Engineering',
       designation: '',
       shift_start_time: '09:00',
       shift_end_time: '18:00',
@@ -146,7 +165,7 @@ export const EmployeesPage = () => {
     try {
       await createEmployeeApi(formData);
       setIsAddModalOpen(false);
-      setSuccessMsg(`Employee ${formData.first_name} ${formData.last_name} created successfully!`);
+      setSuccessMsg(`Permanent employee ${formData.first_name} ${formData.last_name} (${formData.employee_code}) created successfully!`);
       setTimeout(() => setSuccessMsg(''), 4000);
       fetchEmployees();
     } catch (err) {
@@ -156,6 +175,10 @@ export const EmployeesPage = () => {
 
   // Open Edit Modal
   const openEditModal = (emp) => {
+    if (emp.employment_status === 'Resigned' || !emp.is_active) {
+      openViewModal(emp);
+      return;
+    }
     setSelectedEmployee(emp);
     setFormData({
       employee_code: emp.employee_code,
@@ -186,17 +209,40 @@ export const EmployeesPage = () => {
     }
   };
 
-  // Delete Employee
-  const handleDeleteEmployee = async (emp) => {
-    if (!window.confirm(`Are you sure you want to deactivate ${emp.full_name}?`)) return;
+  // Open Resignation Confirmation Modal
+  const openResignModal = (emp) => {
+    setSelectedEmployee(emp);
+    setResignReason('Voluntary Resignation');
+    setIsResignModalOpen(true);
+  };
+
+  // Confirm Resignation Process
+  const handleConfirmResignation = async (e) => {
+    e.preventDefault();
+    if (!selectedEmployee) return;
     try {
-      await deleteEmployeeApi(emp.id);
-      setSuccessMsg(`Employee ${emp.full_name} deactivated.`);
-      setTimeout(() => setSuccessMsg(''), 4000);
+      setResigning(true);
+      await resignEmployeeApi(selectedEmployee.id, resignReason.trim() || 'Voluntary Resignation');
+      setIsResignModalOpen(false);
+      setSuccessMsg(`Employee ${selectedEmployee.full_name} (${selectedEmployee.employee_code}) marked as Resigned. Permanent record preserved.`);
+      setTimeout(() => setSuccessMsg(''), 5000);
       fetchEmployees();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete employee');
+      alert(err.response?.data?.detail || 'Failed to process employee resignation');
+    } finally {
+      setResigning(false);
     }
+  };
+
+  // Open Read-Only View Modal for Resigned/Permanent records
+  const openViewModal = (emp) => {
+    setSelectedEmployee(emp);
+    setIsViewModalOpen(true);
+  };
+
+  // Delete/Archive Employee (delegates safely to permanent resignation)
+  const handleDeleteEmployee = async (emp) => {
+    openResignModal(emp);
   };
 
   // Open Face Registration Modal
@@ -352,35 +398,58 @@ export const EmployeesPage = () => {
       )}
 
       {/* Search & Filters */}
-      <div className="flex flex-col sm:flex-row gap-3 items-center justify-between">
+      <div className="flex flex-col lg:flex-row gap-3 items-center justify-between">
         
         {/* Search Input */}
-        <form onSubmit={handleSearchSubmit} className="relative w-full sm:w-80">
+        <form onSubmit={handleSearchSubmit} className="relative w-full lg:w-80">
           <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by name, ID, or email..."
+            placeholder="Search by GSS ID, name, or email..."
             className="w-full pl-10 pr-4 py-2 rounded-xl bg-slate-900 border border-slate-800 focus:border-indigo-500 text-xs text-white placeholder-slate-500 outline-none"
           />
         </form>
 
-        {/* Department Filter Pills */}
-        <div className="flex items-center space-x-1.5 overflow-x-auto w-full sm:w-auto pb-1 sm:pb-0">
-          {departments.map((dept) => (
-            <button
-              key={dept}
-              onClick={() => setDepartmentFilter(dept)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
-                departmentFilter === dept
-                  ? 'bg-indigo-600 text-white shadow-sm'
-                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-              }`}
-            >
-              {dept}
-            </button>
-          ))}
+        {/* Filter Controls: Status & Department */}
+        <div className="flex flex-wrap items-center gap-2.5 w-full lg:w-auto">
+          {/* Status Filter */}
+          <div className="flex items-center space-x-1 bg-slate-900 p-1 rounded-xl border border-slate-800">
+            {['All', 'Active', 'Resigned'].map((st) => (
+              <button
+                key={st}
+                type="button"
+                onClick={() => setStatusFilter(st)}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                  statusFilter === st
+                    ? st === 'Resigned'
+                      ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30 shadow-sm'
+                      : 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                {st === 'All' ? 'All Status' : st}
+              </button>
+            ))}
+          </div>
+
+          {/* Department Filter Pills */}
+          <div className="flex items-center space-x-1.5 overflow-x-auto pb-1 sm:pb-0">
+            {departments.map((dept) => (
+              <button
+                key={dept}
+                onClick={() => setDepartmentFilter(dept)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
+                  departmentFilter === dept
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+                }`}
+              >
+                {dept}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -390,7 +459,8 @@ export const EmployeesPage = () => {
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-950/70 text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-800">
               <tr>
-                <th className="px-5 py-3.5">Employee</th>
+                <th className="px-5 py-3.5">Employee & GSS ID</th>
+                <th className="px-5 py-3.5">Status</th>
                 <th className="px-5 py-3.5">Department & Role</th>
                 <th className="px-5 py-3.5">Contact Details</th>
                 <th className="px-5 py-3.5">Shift Hours</th>
@@ -400,117 +470,159 @@ export const EmployeesPage = () => {
             </thead>
             <tbody className="divide-y divide-slate-800/80">
               {employees.length > 0 ? (
-                employees.map((emp) => (
-                  <tr key={emp.id} className="hover:bg-slate-800/40 transition-colors">
-                    {/* Employee Profile */}
-                    <td className="px-5 py-4">
-                      <div className="flex items-center space-x-3.5">
-                        {emp.photo_url ? (
-                          <img
-                            src={`${API_BASE_URL}${emp.photo_url}`}
-                            alt={emp.full_name}
-                            className="w-10 h-10 rounded-xl object-cover border border-slate-700"
-                          />
+                employees.map((emp) => {
+                  const isResigned = emp.employment_status === 'Resigned' || !emp.is_active;
+                  return (
+                    <tr key={emp.id} className="hover:bg-slate-800/40 transition-colors">
+                      {/* Employee Profile */}
+                      <td className="px-5 py-4">
+                        <div className="flex items-center space-x-3.5">
+                          {emp.photo_url ? (
+                            <img
+                              src={`${API_BASE_URL}${emp.photo_url}`}
+                              alt={emp.full_name}
+                              className="w-10 h-10 rounded-xl object-cover border border-slate-700"
+                            />
+                          ) : (
+                            <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-indigo-400 text-sm">
+                              {emp.first_name ? emp.first_name.charAt(0) : (emp.name ? emp.name.charAt(0) : 'E')}
+                            </div>
+                          )}
+                          <div>
+                            <p className="font-bold text-white text-sm">{emp.full_name || emp.name}</p>
+                            <span className="font-mono text-[11px] font-semibold text-indigo-400">
+                              {emp.employee_code || emp.employee_id}
+                            </span>
+                          </div>
+                        </div>
+                      </td>
+
+                      {/* Employment Status Badge */}
+                      <td className="px-5 py-4">
+                        {isResigned ? (
+                          <div className="space-y-0.5">
+                            <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                              <AlertCircle className="w-3 h-3" />
+                              <span>Resigned</span>
+                            </span>
+                            {emp.resignation_date && (
+                              <p className="text-[10px] text-slate-400 font-mono">
+                                {new Date(emp.resignation_date).toLocaleDateString()}
+                              </p>
+                            )}
+                          </div>
                         ) : (
-                          <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-indigo-400 text-sm">
-                            {emp.first_name.charAt(0)}
+                          <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>Active</span>
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Department & Role */}
+                      <td className="px-5 py-4">
+                        <p className="font-semibold text-slate-200">{emp.department}</p>
+                        <p className="text-[11px] text-slate-400">{emp.designation}</p>
+                      </td>
+
+                      {/* Contact */}
+                      <td className="px-5 py-4 space-y-0.5">
+                        <div className="flex items-center space-x-1.5 text-slate-300">
+                          <Mail className="w-3 h-3 text-slate-500" />
+                          <span>{emp.email}</span>
+                        </div>
+                        {emp.phone && (
+                          <div className="flex items-center space-x-1.5 text-slate-400 text-[11px]">
+                            <Phone className="w-3 h-3 text-slate-500" />
+                            <span>{emp.phone}</span>
                           </div>
                         )}
-                        <div>
-                          <p className="font-bold text-white text-sm">{emp.full_name}</p>
-                          <span className="font-mono text-[11px] font-semibold text-indigo-400">
-                            {emp.employee_code}
-                          </span>
+                      </td>
+
+                      {/* Shift */}
+                      <td className="px-5 py-4 font-mono text-slate-300 text-[11px]">
+                        <div className="flex items-center space-x-1">
+                          <Clock className="w-3 h-3 text-slate-500" />
+                          <span>{formatTime12Hour(emp.shift_start_time || '09:00:00')} - {formatTime12Hour(emp.shift_end_time || '18:00:00')}</span>
                         </div>
-                      </div>
-                    </td>
+                      </td>
 
-                    {/* Department & Role */}
-                    <td className="px-5 py-4">
-                      <p className="font-semibold text-slate-200">{emp.department}</p>
-                      <p className="text-[11px] text-slate-400">{emp.designation}</p>
-                    </td>
-
-                    {/* Contact */}
-                    <td className="px-5 py-4 space-y-0.5">
-                      <div className="flex items-center space-x-1.5 text-slate-300">
-                        <Mail className="w-3 h-3 text-slate-500" />
-                        <span>{emp.email}</span>
-                      </div>
-                      {emp.phone && (
-                        <div className="flex items-center space-x-1.5 text-slate-400 text-[11px]">
-                          <Phone className="w-3 h-3 text-slate-500" />
-                          <span>{emp.phone}</span>
-                        </div>
-                      )}
-                    </td>
-
-                    {/* Shift */}
-                    <td className="px-5 py-4 font-mono text-slate-300 text-[11px]">
-                      <div className="flex items-center space-x-1">
-                        <Clock className="w-3 h-3 text-slate-500" />
-                        <span>{formatTime12Hour(emp.shift_start_time || '09:00:00')} - {formatTime12Hour(emp.shift_end_time || '18:00:00')}</span>
-                      </div>
-                    </td>
-
-                    {/* Biometric Status */}
-                    <td className="px-5 py-4">
-                      {emp.face_registered ? (
-                        <div className="flex items-center space-x-2">
-                          <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>Enrolled</span>
+                      {/* Biometric Status */}
+                      <td className="px-5 py-4">
+                        {isResigned ? (
+                          <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-800 text-slate-400 border border-slate-700">
+                            <span>Biometrics Revoked</span>
                           </span>
+                        ) : emp.face_registered ? (
+                          <div className="flex items-center space-x-2">
+                            <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Enrolled</span>
+                            </span>
+                            <button
+                              onClick={() => handleRemoveFace(emp)}
+                              title="Remove Biometric Data"
+                              className="p-1 rounded text-slate-500 hover:text-red-400 transition-colors"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ) : (
                           <button
-                            onClick={() => handleRemoveFace(emp)}
-                            title="Remove Biometric Data"
-                            className="p-1 rounded text-slate-500 hover:text-red-400 transition-colors"
+                            onClick={() => openFaceModal(emp)}
+                            className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-indigo-600/10 hover:bg-indigo-600 text-indigo-400 hover:text-white border border-indigo-500/30 transition-all"
                           >
-                            <Trash2 className="w-3 h-3" />
+                            <Camera className="w-3.5 h-3.5" />
+                            <span>Enroll Face</span>
                           </button>
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => openFaceModal(emp)}
-                          className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-indigo-600/10 hover:bg-indigo-600 text-indigo-400 hover:text-white border border-indigo-500/30 transition-all"
-                        >
-                          <Camera className="w-3.5 h-3.5" />
-                          <span>Enroll Face</span>
-                        </button>
-                      )}
-                    </td>
+                        )}
+                      </td>
 
-                    {/* Actions */}
-                    <td className="px-5 py-4 text-right">
-                      <div className="flex items-center justify-end space-x-1.5">
-                        <button
-                          onClick={() => openFaceModal(emp)}
-                          title="Update Biometrics"
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-indigo-400 border border-slate-700 transition-all"
-                        >
-                          <Camera className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => openEditModal(emp)}
-                          title="Edit Details"
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white border border-slate-700 transition-all"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleDeleteEmployee(emp)}
-                          title="Deactivate Employee"
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-red-500/10 text-slate-400 hover:text-red-400 border border-slate-700 hover:border-red-500/30 transition-all"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                      {/* Actions */}
+                      <td className="px-5 py-4 text-right">
+                        <div className="flex items-center justify-end space-x-1.5">
+                          {isResigned ? (
+                            <button
+                              onClick={() => openViewModal(emp)}
+                              title="View Permanent Record (Read-Only)"
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-all flex items-center space-x-1 px-2.5 text-[11px] font-semibold"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>View Record</span>
+                            </button>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => openFaceModal(emp)}
+                                title="Update Biometrics"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-indigo-400 border border-slate-700 transition-all"
+                              >
+                                <Camera className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => openEditModal(emp)}
+                                title="Edit Details"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white border border-slate-700 transition-all"
+                              >
+                                <Edit3 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => openResignModal(emp)}
+                                title="Mark as Resigned (Preserves Record & ID)"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-amber-500/10 text-slate-400 hover:text-amber-400 border border-slate-700 hover:border-amber-500/30 transition-all"
+                              >
+                                <UserMinus className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               ) : (
                 <tr>
-                  <td colSpan="6" className="text-center py-10 text-slate-400 text-xs">
+                  <td colSpan="7" className="text-center py-10 text-slate-400 text-xs">
                     No employees found matching the filter criteria.
                   </td>
                 </tr>
@@ -964,6 +1076,210 @@ export const EmployeesPage = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* EMPLOYEE RESIGNATION CONFIRMATION MODAL                  */}
+      {/* ======================================================== */}
+      {isResignModalOpen && selectedEmployee && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="relative w-full max-w-lg rounded-3xl bg-slate-900 border border-slate-800 p-6 shadow-2xl space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                  <UserMinus className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Mark Employee as Resigned
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Permanent Record & Attendance History Preservation
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsResignModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Target Employee Summary Card */}
+            <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-bold text-white">{selectedEmployee.full_name}</p>
+                <p className="text-xs text-slate-400">{selectedEmployee.designation} • {selectedEmployee.department}</p>
+              </div>
+              <div className="text-right">
+                <span className="font-mono text-xs font-bold text-indigo-400 bg-indigo-500/10 px-2.5 py-1 rounded-lg border border-indigo-500/20">
+                  {selectedEmployee.employee_code}
+                </span>
+                <p className="text-[10px] text-slate-500 mt-1">Permanent GSS ID</p>
+              </div>
+            </div>
+
+            {/* Permanent Policy Info Box */}
+            <div className="p-3.5 rounded-2xl bg-amber-500/5 border border-amber-500/20 text-xs space-y-1.5 text-slate-300">
+              <div className="flex items-center space-x-1.5 text-amber-400 font-bold">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>Permanent Record & Resignation Policy</span>
+              </div>
+              <ul className="list-disc list-inside space-y-1 text-[11px] text-slate-400 pl-1">
+                <li><strong className="text-slate-200">GSS ID Preservation:</strong> The ID <span className="font-mono text-indigo-300">{selectedEmployee.employee_code}</span> will be permanently locked and cannot be reused.</li>
+                <li><strong className="text-slate-200">Authentication Revocation:</strong> Login credentials and active JWT sessions are immediately blocked.</li>
+                <li><strong className="text-slate-200">Biometrics Revocation:</strong> Face recognition vectors are cleared so the employee cannot check in at kiosks.</li>
+                <li><strong className="text-slate-200">Attendance Integrity:</strong> All historical attendance logs and snapshots remain preserved for CEO audits.</li>
+              </ul>
+            </div>
+
+            <form onSubmit={handleConfirmResignation} className="space-y-4">
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
+                  Resignation Reason / Notes
+                </label>
+                <textarea
+                  required
+                  rows={2}
+                  value={resignReason}
+                  onChange={(e) => setResignReason(e.target.value)}
+                  placeholder="e.g. Voluntary Resignation, Career Advancement, Relocation..."
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white placeholder-slate-500 outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsResignModalOpen(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={resigning}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-white text-xs font-bold shadow-lg shadow-amber-600/30 transition-all disabled:opacity-50 flex items-center space-x-1.5"
+                >
+                  <UserMinus className="w-4 h-4" />
+                  <span>{resigning ? 'Processing...' : 'Confirm Resignation'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* READ-ONLY PERMANENT RECORD VIEW MODAL                    */}
+      {/* ======================================================== */}
+      {isViewModalOpen && selectedEmployee && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="relative w-full max-w-lg rounded-3xl bg-slate-900 border border-slate-800 p-6 shadow-2xl space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 rounded-xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Employee Permanent Record
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Read-Only Archive • Gateway Software Solutions
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsViewModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Profile Overview */}
+            <div className="flex items-center space-x-4 p-4 rounded-2xl bg-slate-950 border border-slate-800">
+              {selectedEmployee.photo_url ? (
+                <img
+                  src={`${API_BASE_URL}${selectedEmployee.photo_url}`}
+                  alt={selectedEmployee.full_name}
+                  className="w-14 h-14 rounded-2xl object-cover border border-slate-700"
+                />
+              ) : (
+                <div className="w-14 h-14 rounded-2xl bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-indigo-400 text-lg">
+                  {selectedEmployee.first_name ? selectedEmployee.first_name.charAt(0) : 'E'}
+                </div>
+              )}
+              <div className="space-y-1">
+                <div className="flex items-center space-x-2">
+                  <h4 className="font-extrabold text-white text-base">{selectedEmployee.full_name}</h4>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                    {selectedEmployee.employment_status || 'Resigned'}
+                  </span>
+                </div>
+                <div className="flex items-center space-x-2 font-mono text-xs">
+                  <span className="text-indigo-400 font-bold">{selectedEmployee.employee_code}</span>
+                  <span className="text-slate-500">•</span>
+                  <span className="text-slate-400">{selectedEmployee.designation}</span>
+                </div>
+                <p className="text-xs text-slate-500">{selectedEmployee.department}</p>
+              </div>
+            </div>
+
+            {/* Detailed Properties Grid */}
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Permanent GSS ID</span>
+                <span className="font-mono font-bold text-indigo-300">{selectedEmployee.employee_code}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Employment Status</span>
+                <span className="font-bold text-amber-400">{selectedEmployee.employment_status || 'Resigned'}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Joining Date</span>
+                <span className="text-slate-300">{selectedEmployee.created_at ? new Date(selectedEmployee.created_at).toLocaleDateString() : 'N/A'}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Resignation Date</span>
+                <span className="text-slate-300">{selectedEmployee.resignation_date ? new Date(selectedEmployee.resignation_date).toLocaleDateString() : 'Recorded'}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Email Address</span>
+                <span className="text-slate-300 truncate block">{selectedEmployee.email}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block mb-0.5">Phone Number</span>
+                <span className="text-slate-300">{selectedEmployee.phone || 'N/A'}</span>
+              </div>
+            </div>
+
+            {/* Resignation Reason Box */}
+            {selectedEmployee.resignation_reason && (
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400 block">Recorded Resignation Reason</span>
+                <p className="text-slate-300 italic">"{selectedEmployee.resignation_reason}"</p>
+              </div>
+            )}
+
+            <div className="p-3 rounded-xl bg-indigo-500/5 border border-indigo-500/20 text-[11px] text-slate-400 flex items-center space-x-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>Historical attendance records and logs remain permanently linked and accessible in CEO reports.</span>
+            </div>
+
+            <div className="flex justify-end pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsViewModalOpen(false)}
+                className="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-colors"
+              >
+                Close Record
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User
+from models import User, Employee
 
 SECRET_KEY = "gateway_software_solutions_super_secret_jwt_key_2026"
 ALGORITHM = "HS256"
@@ -70,6 +70,22 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
+        )
+    if hasattr(user, "is_active") and user.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account has been deactivated or resigned. Session revoked.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    resigned_emp = db.query(Employee).filter(
+        Employee.email == user.email,
+        (Employee.employment_status == "Resigned") | (Employee.is_active == False)
+    ).first()
+    if resigned_emp and user.role != "CEO":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Employee access revoked due to resignation.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     return user
 
