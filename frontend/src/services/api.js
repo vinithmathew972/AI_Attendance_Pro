@@ -101,6 +101,20 @@ export const deleteEmployeeApi = async (id) => {
   return res.data;
 };
 
+export const getEmployeeDeletionPreviewApi = async (id) => {
+  const res = await api.get(`/api/employees/${id}/deletion-preview`);
+  return res.data;
+};
+
+export const permanentlyDeleteEmployeeApi = async (id) => {
+  const res = await api.delete(`/api/employees/${id}/permanent`);
+  return {
+    ...res.data,
+    httpStatus: res.status,
+    isPartialSuccess: res.status === 207 || res.data?.partial_success === true,
+  };
+};
+
 export const resignEmployeeApi = async (id, reason = '', resignationDate = null) => {
   const res = await api.post(`/api/employees/${id}/resign`, {
     reason,

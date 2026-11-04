@@ -32,6 +32,8 @@ import {
   removeFaceApi,
   getDepartmentsApi,
   createDepartmentApi,
+  getEmployeeDeletionPreviewApi,
+  permanentlyDeleteEmployeeApi,
   API_BASE_URL 
 } from '../services/api';
 import { DepartmentModal } from '../components/DepartmentModal';
@@ -43,6 +45,7 @@ export const EmployeesPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [warningMsg, setWarningMsg] = useState('');
 
   // Search & Filter
   const [search, setSearch] = useState('');
@@ -59,6 +62,14 @@ export const EmployeesPage = () => {
   const [selectedEmployee, setSelectedEmployee] = useState(null);
   const [resignReason, setResignReason] = useState('Voluntary Resignation');
   const [resigning, setResigning] = useState(false);
+
+  // Permanent Delete Modal State (Resigned Employees Only)
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [deletePreview, setDeletePreview] = useState(null);
+  const [loadingDeletePreview, setLoadingDeletePreview] = useState(false);
+  const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
+  const [isDeletingPermanent, setIsDeletingPermanent] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
 
   // Quick department entry state inside add/edit
   const [customDeptInput, setCustomDeptInput] = useState('');
@@ -240,6 +251,58 @@ export const EmployeesPage = () => {
     setIsViewModalOpen(true);
   };
 
+  // Open Permanent Deletion Modal (Resigned Employees Only)
+  const openDeleteModal = async (emp) => {
+    setSelectedEmployee(emp);
+    setDeleteConfirmChecked(false);
+    setDeleteError('');
+    setDeletePreview(null);
+    setIsDeleteModalOpen(true);
+    try {
+      setLoadingDeletePreview(true);
+      const preview = await getEmployeeDeletionPreviewApi(emp.id);
+      setDeletePreview(preview);
+    } catch (err) {
+      console.error('Failed to load deletion preview:', err);
+      setDeleteError(err.response?.data?.detail || 'Failed to load employee deletion preview.');
+    } finally {
+      setLoadingDeletePreview(false);
+    }
+  };
+
+  // Execute Permanent Deletion (Requires Explicit Two-Step Checkbox Confirmation)
+  const handleConfirmPermanentDelete = async (e) => {
+    if (e) e.preventDefault();
+    if (!selectedEmployee || !deleteConfirmChecked || isDeletingPermanent) return;
+    try {
+      setIsDeletingPermanent(true);
+      setDeleteError('');
+      const res = await permanentlyDeleteEmployeeApi(selectedEmployee.id);
+      setIsDeleteModalOpen(false);
+
+      // Check for partial cleanup (HTTP 207 or failed physical files)
+      if (res.isPartialSuccess || res.partial_success || (res.failed_file_count && res.failed_file_count > 0)) {
+        const failedCount = res.failed_file_count || res.files_failed_count || 1;
+        setWarningMsg(
+          `Partial Cleanup: Resigned employee ${selectedEmployee.full_name} (${selectedEmployee.employee_code}) and ${res.deleted_attendances ?? 0} attendance record(s) were permanently removed from the database. However, ${failedCount} physical snapshot file(s) could not be removed from disk.`
+        );
+        setTimeout(() => setWarningMsg(''), 8000);
+      } else {
+        setSuccessMsg(
+          `Resigned employee ${selectedEmployee.full_name} (${selectedEmployee.employee_code}) and ${res.deleted_attendances ?? 0} attendance record(s) permanently deleted.`
+        );
+        setTimeout(() => setSuccessMsg(''), 6000);
+      }
+
+      fetchEmployees();
+    } catch (err) {
+      console.error('Permanent deletion failed:', err);
+      setDeleteError(err.response?.data?.detail || 'Failed to permanently delete employee.');
+    } finally {
+      setIsDeletingPermanent(false);
+    }
+  };
+
   // Delete/Archive Employee (delegates safely to permanent resignation)
   const handleDeleteEmployee = async (emp) => {
     openResignModal(emp);
@@ -392,8 +455,16 @@ export const EmployeesPage = () => {
       {/* Success Banner */}
       {successMsg && (
         <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium flex items-center space-x-2">
-          <CheckCircle2 className="w-4 h-4" />
+          <CheckCircle2 className="w-4 h-4 shrink-0" />
           <span>{successMsg}</span>
+        </div>
+      )}
+
+      {/* Partial Cleanup Warning Banner */}
+      {warningMsg && (
+        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium flex items-center space-x-2">
+          <AlertCircle className="w-4 h-4 shrink-0 text-amber-400" />
+          <span>{warningMsg}</span>
         </div>
       )}
 
@@ -582,14 +653,24 @@ export const EmployeesPage = () => {
                       <td className="px-5 py-4 text-right">
                         <div className="flex items-center justify-end space-x-1.5">
                           {isResigned ? (
-                            <button
-                              onClick={() => openViewModal(emp)}
-                              title="View Permanent Record (Read-Only)"
-                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-all flex items-center space-x-1 px-2.5 text-[11px] font-semibold"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                              <span>View Record</span>
-                            </button>
+                            <>
+                              <button
+                                onClick={() => openViewModal(emp)}
+                                title="View Permanent Record (Read-Only)"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-all flex items-center space-x-1 px-2.5 text-[11px] font-semibold"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                <span>View Record</span>
+                              </button>
+                              <button
+                                onClick={() => openDeleteModal(emp)}
+                                title="Permanently Delete Resigned Employee"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 border border-slate-700 hover:border-rose-500/30 transition-all flex items-center space-x-1 px-2 text-[11px] font-semibold"
+                              >
+                                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                <span>Delete</span>
+                              </button>
+                            </>
                           ) : (
                             <>
                               <button
@@ -1278,6 +1359,134 @@ export const EmployeesPage = () => {
                 className="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-colors"
               >
                 Close Record
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Permanent Delete Modal for Resigned Employees */}
+      {isDeleteModalOpen && selectedEmployee && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-rose-500/30 rounded-3xl p-6 sm:p-7 max-w-lg w-full space-y-5 shadow-2xl relative text-slate-100">
+            {/* Modal Header */}
+            <div className="flex items-start justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 rounded-xl bg-rose-500/10 text-rose-400 border border-rose-500/20">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-extrabold text-white">Permanently Delete Employee</h3>
+                  <p className="text-xs text-rose-400/90 font-medium mt-0.5">
+                    Critical Administrative Action • Resigned Staff Only
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !isDeletingPermanent && setIsDeleteModalOpen(false)}
+                disabled={isDeletingPermanent}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors disabled:opacity-50"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Error Alert */}
+            {deleteError && (
+              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-start space-x-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{deleteError}</span>
+              </div>
+            )}
+
+            {/* Employee Details Summary Card */}
+            <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h4 className="font-bold text-white text-sm">{selectedEmployee.full_name}</h4>
+                  <p className="font-mono text-xs text-indigo-400">{selectedEmployee.employee_code}</p>
+                </div>
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                  {selectedEmployee.employment_status || 'Resigned'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs pt-2 border-t border-slate-800/80">
+                <div>
+                  <span className="text-[10px] font-semibold text-slate-500 uppercase">Department</span>
+                  <p className="text-slate-300 font-medium">{selectedEmployee.department}</p>
+                </div>
+                <div>
+                  <span className="text-[10px] font-semibold text-slate-500 uppercase">Designation</span>
+                  <p className="text-slate-300 font-medium">{selectedEmployee.designation}</p>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+                <span className="text-slate-400 font-medium">Associated Attendance Records:</span>
+                {loadingDeletePreview ? (
+                  <span className="text-slate-400 animate-pulse text-[11px]">Counting records...</span>
+                ) : (
+                  <span className="font-bold font-mono text-amber-400">
+                    {deletePreview?.attendance_count ?? 0} record(s)
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Critical Warning Banner */}
+            <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200 space-y-1">
+              <p className="font-bold text-rose-300 flex items-center space-x-1.5">
+                <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+                <span>Warning: Irreversible Deletion</span>
+              </p>
+              <p className="text-[11px] leading-relaxed text-rose-200/90">
+                This will permanently remove this employee record, their biometric face profile, and all {deletePreview?.attendance_count ?? 0} attendance records from the database. This action CANNOT be undone.
+              </p>
+            </div>
+
+            {/* Two-Step Confirmation Checkbox */}
+            <label className="flex items-start space-x-3 cursor-pointer p-3 rounded-xl bg-slate-950/60 border border-slate-800 hover:border-slate-700 transition-colors">
+              <input
+                type="checkbox"
+                checked={deleteConfirmChecked}
+                onChange={(e) => setDeleteConfirmChecked(e.target.checked)}
+                disabled={isDeletingPermanent || loadingDeletePreview}
+                className="mt-0.5 w-4 h-4 rounded text-rose-600 focus:ring-rose-500 border-slate-700 bg-slate-800 shrink-0"
+              />
+              <span className="text-xs text-slate-300 select-none">
+                I understand this deletion is permanent and explicitly authorize the removal of this resigned employee and their associated records.
+              </span>
+            </label>
+
+            {/* Modal Action Buttons */}
+            <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsDeleteModalOpen(false)}
+                disabled={isDeletingPermanent}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-semibold transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={handleConfirmPermanentDelete}
+                disabled={!deleteConfirmChecked || isDeletingPermanent || loadingDeletePreview}
+                className="flex items-center space-x-2 px-5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-lg shadow-rose-600/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {isDeletingPermanent ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                    <span>Permanently Deleting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Permanently Delete Employee</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

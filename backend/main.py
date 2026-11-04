@@ -6,13 +6,15 @@ import datetime
 import base64
 import sqlite3
 import tempfile
+import threading
+import shutil
 import numpy as np
 from typing import Optional, List, Union
 from starlette.background import BackgroundTask
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
@@ -714,6 +716,556 @@ def delete_employee(
         "message": f"Employee {emp.name} ({emp.employee_id}) marked as Resigned. Permanent record and attendance history preserved.",
         "employment_status": "Resigned"
     }
+
+# =========================================================================
+# 2.2. RESIGNED EMPLOYEE PERMANENT DELETION (CEO ONLY, STRICT VALIDATION)
+# =========================================================================
+
+# Concurrency lock and in-progress deletion tracking
+# Note: Process-wide threading lock coordinates concurrent requests hitting this worker.
+# In single-process deployments (like Render Free), this prevents simultaneous deletion attempts.
+# Inside the database transaction, employee existence and status are re-verified atomically.
+_deletion_lock = threading.Lock()
+_active_deletions = set()
+
+def get_verified_persistent_backup_dir() -> str:
+    """
+    Validates and returns the configured persistent backup directory.
+    Safety Policy & Documentation:
+    1. PERSISTENT_BACKUP_DIR must be explicitly configured in the environment pointing to a verified persistent disk mount.
+    2. Note: Testing directory writability verifies filesystem access permissions, but cannot automatically prove
+       that the underlying volume is a cloud persistent disk. The operator must ensure PERSISTENT_BACKUP_DIR
+       points to an actual attached persistent mount path on Render (e.g. a Render Persistent Disk).
+    3. Cannot default to BASE_DIR, tempfile, or ephemeral container root storage.
+    4. If PERSISTENT_BACKUP_DIR is not configured, permanent deletion is aborted with HTTP 500
+       to guarantee no irreversible deletion occurs without durable backup storage.
+    5. Evaluated at runtime when permanent deletion is invoked; never at module import time,
+       so application startup and unrelated services remain unaffected.
+    """
+    backup_dir = os.getenv("PERSISTENT_BACKUP_DIR")
+    if not backup_dir or not str(backup_dir).strip():
+        raise HTTPException(
+            status_code=500,
+            detail="Persistent backup storage is not configured: PERSISTENT_BACKUP_DIR environment variable is missing or empty. Permanent deletion is rejected to prevent irreversible data loss."
+        )
+
+    backup_dir = os.path.realpath(backup_dir.strip())
+
+    # Reject temporary directories or ephemeral system /tmp
+    temp_dir = os.path.realpath(tempfile.gettempdir())
+    try:
+        if os.path.commonpath([backup_dir, temp_dir]) == temp_dir:
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid backup configuration: PERSISTENT_BACKUP_DIR cannot be located within an ephemeral or system temporary directory."
+            )
+    except ValueError:
+        pass  # Different drive letters on Windows
+
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        # Test writability with a small probe file
+        test_probe = os.path.join(backup_dir, f".probe_write_{os.getpid()}")
+        with open(test_probe, "w", encoding="utf-8") as f:
+            f.write("probe")
+        if os.path.exists(test_probe):
+            os.remove(test_probe)
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Persistent backup storage directory is inaccessible or not writable. Please check server storage configuration."
+        )
+
+    return backup_dir
+
+def create_and_verify_point_in_time_backup(
+    db: Session,
+    employee_id: int,
+    files_to_backup: Optional[List[str]] = None
+) -> dict:
+    """
+    Creates a fresh, verified point-in-time database AND file backup prior to permanent deletion.
+    - Requires PERSISTENT_BACKUP_DIR to be configured in verified persistent storage.
+    - Rejects reliance on old or unverified backups.
+    - Runs PRAGMA quick_check to verify cryptographic page integrity.
+    - Audits table existence and verifies that backup row counts match live database.
+    - Archives all associated physical snapshot and photo files into a dedicated backup folder.
+    - Writes a recovery manifest documenting database and file recovery assets.
+    - If persistent backup storage is unavailable or verification fails, aborts deletion.
+    """
+    durable_backup_dir = get_verified_persistent_backup_dir()
+
+    timestamp_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_base = f"pre_delete_emp_{employee_id}_{timestamp_str}"
+    backup_filename = f"{backup_base}.db"
+    backup_path = os.path.join(durable_backup_dir, backup_filename)
+    files_backup_dir = os.path.join(durable_backup_dir, f"{backup_base}_files")
+    manifest_path = os.path.join(durable_backup_dir, f"{backup_base}_manifest.json")
+
+    # 1. Capture live counts before backup
+    live_emp_count = db.query(Employee).count()
+    live_att_count = db.query(Attendance).count()
+
+    # 2. Perform point-in-time online backup using SQLite backup API
+    try:
+        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        dst = sqlite3.connect(backup_path)
+        try:
+            with dst:
+                src.backup(dst, pages=-1)
+        finally:
+            dst.close()
+            src.close()
+    except Exception:
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail="Database backup creation failed. Permanent deletion aborted."
+        )
+
+    # 3. Verify database backup file integrity and counts
+    try:
+        verif = verify_sqlite_backup(backup_path)
+        if not verif.get("verified"):
+            raise ValueError("Backup verification returned unverified status.")
+
+        # Ensure backup record counts match live database state
+        if verif["employee_count"] != live_emp_count:
+            raise ValueError("Backup employee count mismatch.")
+        if verif["attendance_count"] != live_att_count:
+            raise ValueError("Backup attendance count mismatch.")
+
+    except Exception:
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail="Database backup integrity verification failed. Permanent deletion aborted."
+        )
+
+    # 4. Back up associated physical files (if any exist) into persistent backup storage
+    backed_up_file_records = []
+    if files_to_backup:
+        try:
+            os.makedirs(files_backup_dir, exist_ok=True)
+            for src_file in files_to_backup:
+                if os.path.isfile(src_file):
+                    dst_file = os.path.join(files_backup_dir, os.path.basename(src_file))
+                    shutil.copy2(src_file, dst_file)
+                    src_size = os.path.getsize(src_file)
+                    dst_size = os.path.getsize(dst_file)
+                    if src_size != dst_size:
+                        raise ValueError(f"File copy verification size mismatch for {os.path.basename(src_file)}.")
+                    backed_up_file_records.append({
+                        "filename": os.path.basename(src_file),
+                        "bytes": dst_size
+                    })
+        except Exception:
+            # Clean up both DB backup and partial files backup
+            if os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except Exception:
+                    pass
+            if os.path.exists(files_backup_dir):
+                try:
+                    shutil.rmtree(files_backup_dir)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail="Physical file backup preservation failed. Permanent deletion aborted."
+            )
+
+    # 5. Write and verify complete recovery manifest
+    recovery_scope = (
+        f"COMPLETE (SQLite database snapshot + {len(backed_up_file_records)} physical snapshot/photo file(s))"
+        if backed_up_file_records else
+        "COMPLETE (SQLite database snapshot; employee had no separate physical snapshot/photo files)"
+    )
+    manifest_data = {
+        "timestamp_utc": datetime.datetime.utcnow().isoformat(),
+        "employee_id": employee_id,
+        "database_backup": os.path.basename(backup_path),
+        "database_file_size": os.path.getsize(backup_path),
+        "live_employee_count": live_emp_count,
+        "live_attendance_count": live_att_count,
+        "files_backed_up": backed_up_file_records,
+        "recovery_scope": recovery_scope,
+        "verified": True
+    }
+
+    def _cleanup_current_backup_artifacts():
+        """Safely cleans up only this specific operation's backup artifacts without deleting existing backups."""
+        if os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+        if os.path.exists(files_backup_dir):
+            try:
+                shutil.rmtree(files_backup_dir)
+            except Exception:
+                pass
+        if os.path.exists(manifest_path):
+            try:
+                os.remove(manifest_path)
+            except Exception:
+                pass
+
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            json.dump(manifest_data, mf, indent=2)
+    except Exception:
+        _cleanup_current_backup_artifacts()
+        raise HTTPException(
+            status_code=500,
+            detail="Recovery manifest creation failed. Permanent deletion aborted."
+        )
+
+    # 6. Verify that all backup artifacts (database, files, manifest) exist and are readable before allowing deletion
+    try:
+        # A. Database backup existence and readability
+        if not os.path.isfile(backup_path) or os.path.getsize(backup_path) == 0:
+            raise ValueError(f"Database backup '{os.path.basename(backup_path)}' is missing or unreadable.")
+        with open(backup_path, "rb") as bf:
+            header = bf.read(16)
+            if not header.startswith(b"SQLite format 3"):
+                raise ValueError("Database backup header corrupted.")
+
+        # B. Files backup directory verification
+        if backed_up_file_records:
+            if not os.path.isdir(files_backup_dir):
+                raise ValueError("Employee files backup directory is missing.")
+            for rec in backed_up_file_records:
+                copied_path = os.path.join(files_backup_dir, rec["filename"])
+                if not os.path.isfile(copied_path) or os.path.getsize(copied_path) != rec["bytes"]:
+                    raise ValueError(f"Backed up file '{rec['filename']}' is missing or corrupted.")
+                with open(copied_path, "rb") as cf:
+                    _ = cf.read(64)
+
+        # C. Manifest existence, non-zero size, and readability
+        if not os.path.isfile(manifest_path) or os.path.getsize(manifest_path) == 0:
+            raise ValueError("Recovery manifest file is missing or empty.")
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            loaded_manifest = json.load(mf)
+        if not loaded_manifest.get("verified") or loaded_manifest.get("employee_id") != employee_id:
+            raise ValueError("Recovery manifest content verification failed.")
+
+    except Exception:
+        _cleanup_current_backup_artifacts()
+        raise HTTPException(
+            status_code=500,
+            detail="Backup artifact verification failed. Permanent deletion aborted."
+        )
+
+    return {
+        "database_backup": backup_path,
+        "database_backup_filename": os.path.basename(backup_path),
+        "files_backup_dir": files_backup_dir if backed_up_file_records else None,
+        "manifest_path": manifest_path,
+        "manifest_filename": os.path.basename(manifest_path),
+        "verified": True,
+        "employee_count": live_emp_count,
+        "attendance_count": live_att_count,
+        "files_backed_up_count": len(backed_up_file_records),
+        "recovery_scope": recovery_scope
+    }
+
+def validate_and_resolve_upload_file(rel_url: str, employee_id: int) -> Optional[str]:
+    """
+    Strictly validates and resolves an upload file path:
+    1. Resolves path using os.path.realpath().
+    2. Validates path containment using os.path.commonpath() against approved UPLOADS_DIR.
+    3. Verifies that the file name specifically belongs to the employee (e.g. emp_{id}_ or in_{id}_ / out_{id}_ / snap_{id}_).
+    4. Never uses wildcards.
+    5. Returns canonical path if valid and existing, else None.
+    """
+    if not rel_url or not isinstance(rel_url, str):
+        return None
+
+    clean_rel = rel_url.lstrip("/").replace("/", os.sep)
+    target_path = os.path.realpath(os.path.join(BASE_DIR, clean_rel))
+    approved_uploads = os.path.realpath(UPLOADS_DIR)
+
+    # Path containment check using os.path.commonpath()
+    try:
+        if os.path.commonpath([target_path, approved_uploads]) != approved_uploads:
+            return None
+    except Exception:
+        return None
+
+    # Verify file exists and is a regular file
+    if not os.path.isfile(target_path):
+        return None
+
+    # Filename must explicitly belong to this employee (no wildcards)
+    fname = os.path.basename(target_path)
+    allowed_prefixes = (
+        f"emp_{employee_id}_",
+        f"in_{employee_id}_",
+        f"out_{employee_id}_",
+        f"snap_{employee_id}_"
+    )
+    if not fname.startswith(allowed_prefixes):
+        return None
+
+    return target_path
+
+@app.get("/api/employees/{employee_id}/deletion-preview", tags=["Employees"])
+def get_employee_deletion_preview(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    CEO-only endpoint to preview the impact of permanently deleting a Resigned employee.
+    Strictly validates:
+      employment_status == 'Resigned' AND is_active == False.
+    Rejects Active employees with HTTP 400.
+    """
+    emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found.")
+
+    # Strict validation: Require BOTH employment_status == 'Resigned' AND is_active == False
+    if emp.employment_status != "Resigned" or emp.is_active is not False:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Permanent deletion rejected: Employee '{emp.name}' ({emp.employee_id}) must satisfy BOTH employment_status == 'Resigned' AND is_active == False. Current status: employment_status='{emp.employment_status}', is_active={emp.is_active}."
+        )
+
+    attendance_count = db.query(Attendance).filter(Attendance.employee_id == emp.id).count()
+
+    return {
+        "id": emp.id,
+        "employee_id": emp.employee_id,
+        "name": emp.name,
+        "department": emp.department,
+        "designation": emp.designation,
+        "employment_status": emp.employment_status,
+        "is_active": emp.is_active,
+        "resignation_date": emp.resignation_date,
+        "attendance_count": attendance_count,
+        "photo_url": emp.photo_url
+    }
+
+@app.delete("/api/employees/{employee_id}/permanent", tags=["Employees"])
+def permanently_delete_resigned_employee(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_ceo: User = Depends(get_current_ceo)
+):
+    """
+    Permanently deletes a single Resigned employee and their associated records.
+    Strict Security & Data Rules:
+    1. Authenticated CEO users only.
+    2. Concurrency Control: Prevents simultaneous deletion requests for the same employee via process lock.
+    3. Re-validates employee existence and Resigned status inside the atomic transaction to prevent race conditions.
+    4. Employee must exist and strictly satisfy BOTH employment_status == 'Resigned' AND is_active == False.
+    5. Backup Freshness & Durability: Generates and verifies a fresh point-in-time backup of database AND files in PERSISTENT_BACKUP_DIR.
+    6. Collects all attendance snapshot paths and photo paths into memory BEFORE deleting rows.
+    7. Atomically deletes attendances first (FK safety), employee record second (purges BLOB & encoding), and inserts audit log.
+    8. Automatically rolls back the transaction on any database failure.
+    9. Does NOT query attendance records again after commit.
+    10. Performs physical file deletion strictly AFTER database commit.
+    11. Uses strict uploads-directory containment validation and employee prefix checks; never wildcards.
+    12. Returns HTTP 207 Multi-Status on partial cleanup (files remaining) or HTTP 200 on complete cleanup.
+    """
+    # Concurrency Lock: Prevent simultaneous deletion requests for the same employee
+    with _deletion_lock:
+        if employee_id in _active_deletions:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Conflict: A deletion operation for employee ID {employee_id} is already in progress."
+            )
+        _active_deletions.add(employee_id)
+
+    try:
+        emp = db.query(Employee).filter(Employee.id == employee_id).first()
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found.")
+
+        # Strict validation: Require BOTH employment_status == 'Resigned' AND is_active == False
+        if emp.employment_status != "Resigned" or emp.is_active is not False:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Permanent deletion rejected: Employee '{emp.name}' ({emp.employee_id}) must satisfy BOTH employment_status == 'Resigned' AND is_active == False. Current status: employment_status='{emp.employment_status}', is_active={emp.is_active}."
+            )
+
+        emp_id_val = emp.id
+        emp_code = emp.employee_id
+        emp_name = emp.name
+        had_biometrics = bool(emp.face_registered or emp.face_encoding or emp.face_image)
+
+        # 1. Collect all candidate snapshot paths and profile photo into memory BEFORE deleting anything
+        emp_attendances = db.query(Attendance).filter(Attendance.employee_id == emp_id_val).all()
+        initial_att_ids = [att.id for att in emp_attendances]
+        stored_snapshot_paths = [att.snapshot_path for att in emp_attendances if att.snapshot_path]
+        stored_photo_url = emp.photo_url
+
+        # Validate and resolve safe canonical paths belonging to this employee
+        files_to_delete = []
+        if stored_photo_url:
+            safe_photo = validate_and_resolve_upload_file(stored_photo_url, emp_id_val)
+            if safe_photo:
+                files_to_delete.append(safe_photo)
+
+        for sp in stored_snapshot_paths:
+            safe_snap = validate_and_resolve_upload_file(sp, emp_id_val)
+            if safe_snap:
+                files_to_delete.append(safe_snap)
+
+        files_to_delete = list(dict.fromkeys(files_to_delete))
+
+        # 2. Fresh Point-In-Time Backup Generation & Verification in Verified Persistent Storage
+        # Backs up both SQLite database AND all physical snapshot/photo files
+        backup_result = create_and_verify_point_in_time_backup(
+            db=db,
+            employee_id=emp_id_val,
+            files_to_backup=files_to_delete
+        )
+
+        # 3. Transactional Database Deletion with Strict Consistency Safeguards
+        # In SQLAlchemy 2.0, previous query operations autobegan a transaction on db.
+        # To establish a clean, explicit write transaction with with db.begin(), rollback the read state:
+        if db.in_transaction():
+            db.rollback()
+
+        try:
+            with db.begin():
+                # Re-verify employee inside transaction to guard against concurrent status change or deletion
+                emp_to_delete = db.query(Employee).filter(
+                    Employee.id == emp_id_val,
+                    Employee.employment_status == "Resigned",
+                    Employee.is_active == False
+                ).first()
+                if not emp_to_delete:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Concurrent modification detected: Employee record or status changed during processing."
+                    )
+
+                if emp_to_delete.photo_url != stored_photo_url:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Concurrent modification detected: Employee profile photo changed during processing. Deletion aborted."
+                    )
+
+                # Verify attendance record set consistency inside transaction before deleting
+                current_att_rows = db.query(Attendance).filter(Attendance.employee_id == emp_id_val).all()
+                current_att_ids = [att.id for att in current_att_rows]
+                if set(current_att_ids) != set(initial_att_ids):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Concurrent modification detected: Attendance records changed during processing. Deletion aborted."
+                    )
+
+                # A. Delete dependent attendances first (satisfies foreign key constraints)
+                deleted_attendance_count = db.query(Attendance).filter(
+                    Attendance.employee_id == emp_id_val
+                ).delete(synchronize_session=False)
+
+                if deleted_attendance_count != len(initial_att_ids):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Concurrent modification detected: Attendance deletion count mismatch. Deletion aborted."
+                    )
+
+                # B. Delete employee record (purges face_image BLOB and face_encoding from database)
+                db.delete(emp_to_delete)
+
+                # C. Insert audit trail documenting biometric removal (never logs raw bytes or float vectors)
+                biometric_audit = "Biometric face vectors and image BLOBs were purged from database." if had_biometrics else "No registered biometrics were present."
+                audit = AuditLog(
+                    action="EMPLOYEE_PERMANENT_DELETE",
+                    details=f"Permanent deletion of Resigned employee {emp_name} (ID: {emp_id_val}, Code: {emp_code}) executed by CEO {current_ceo.full_name} ({current_ceo.email}). Deleted {deleted_attendance_count} associated attendance record(s). {biometric_audit}",
+                    timestamp=datetime.datetime.utcnow()
+                )
+                db.add(audit)
+
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="Database transaction failed and was rolled back."
+            )
+
+        # 4. Note: Attendances have been committed and deleted.
+        # We do NOT query Attendance table again! All paths were already collected into memory.
+
+        # 5. Perform physical file deletion strictly AFTER database commit
+        removed_files = []
+        failed_files = []
+
+        for fpath in files_to_delete:
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+                    removed_files.append(os.path.basename(fpath))
+            except Exception:
+                failed_files.append({
+                    "filename": os.path.basename(fpath),
+                    "error": "File removal failed due to access restriction or file lock"
+                })
+
+        sanitized_backup_summary = {
+            "verified": backup_result["verified"],
+            "recovery_scope": backup_result["recovery_scope"],
+            "database_backup": backup_result["database_backup_filename"],
+            "manifest": backup_result["manifest_filename"],
+            "files_backed_up_count": backup_result["files_backed_up_count"]
+        }
+
+        # 6. Response Handling
+        # If any physical file failed to remove, return HTTP 207 Multi-Status
+        if failed_files:
+            return JSONResponse(
+                status_code=207,
+                content={
+                    "success": True,
+                    "partial_success": True,
+                    "message": f"Resigned employee {emp_name} ({emp_code}) database record and {deleted_attendance_count} attendance records permanently deleted. However, {len(failed_files)} physical snapshot file(s) could not be removed from disk.",
+                    "deleted_employee_id": emp_id_val,
+                    "deleted_employee_code": emp_code,
+                    "deleted_attendances": deleted_attendance_count,
+                    "biometrics_purged": had_biometrics,
+                    "backup": sanitized_backup_summary,
+                    "files_removed_count": len(removed_files),
+                    "failed_file_count": len(failed_files),
+                    "files_removed": removed_files,
+                    "files_failed_removal": failed_files,
+                    "all_files_removed": False
+                }
+            )
+
+        return {
+            "success": True,
+            "partial_success": False,
+            "message": f"Resigned employee {emp_name} ({emp_code}) permanently deleted.",
+            "deleted_employee_id": emp_id_val,
+            "deleted_employee_code": emp_code,
+            "deleted_attendances": deleted_attendance_count,
+            "biometrics_purged": had_biometrics,
+            "backup": sanitized_backup_summary,
+            "files_removed_count": len(removed_files),
+            "failed_file_count": 0,
+            "files_removed": removed_files,
+            "files_failed_removal": [],
+            "all_files_removed": True
+        }
+
+    finally:
+        with _deletion_lock:
+            _active_deletions.discard(employee_id)
 
 @app.post("/api/employees/{employee_id}/register-face", tags=["Face Registration"])
 def register_employee_face(
