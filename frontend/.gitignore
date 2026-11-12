@@ -1,0 +1,31 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+
+# Employee biometric data
+backend/uploads/
+
+# Frontend dependencies and build
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Temporary files
+scratch/
+*.log
+.DS_Store
+Thumbs.db
