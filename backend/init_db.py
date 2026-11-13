@@ -3,9 +3,14 @@ import datetime
 import random
 import json
 from sqlalchemy.orm import Session
-from .database import SessionLocal, engine, Base
-from .models import User, Employee, Attendance, AuditLog, Department
-from .auth import hash_password
+try:
+    from .database import SessionLocal, engine, Base
+    from .models import User, Employee, Attendance, AuditLog, Department
+    from .auth import hash_password
+except (ImportError, ValueError):
+    from database import SessionLocal, engine, Base
+    from models import User, Employee, Attendance, AuditLog, Department
+    from auth import hash_password
 
 def initialize_database():
     """Initializes SQLite database schema and seeds initial records for Gateway Software Solutions."""

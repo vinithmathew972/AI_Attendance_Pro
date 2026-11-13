@@ -1,7 +1,10 @@
 import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey
 from sqlalchemy.orm import relationship
-from .database import Base
+try:
+    from .database import Base
+except (ImportError, ValueError):
+    from database import Base
 from sqlalchemy import LargeBinary
 
 class User(Base):

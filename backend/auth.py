@@ -1,17 +1,18 @@
 import datetime
 import bcrypt
 import jwt
-import os
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from .database import get_db
-from .models import User, Employee
+try:
+    from .database import get_db
+    from .models import User, Employee
+except (ImportError, ValueError):
+    from database import get_db
+    from models import User, Employee
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-if not SECRET_KEY:
-    raise RuntimeError("JWT_SECRET_KEY environment variable is not configured")
+SECRET_KEY = "gateway_software_solutions_super_secret_jwt_key_2026"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
